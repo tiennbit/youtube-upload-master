@@ -220,18 +220,41 @@ async function processJob(
       );
 
       if (entries.length > 0) {
-        // entries sorted by createdAt ASC → pick LAST = newest (vừa làm xong)
-        const newest = entries[entries.length - 1];
-        log(`📌 Chọn video MỚI NHẤT: "${newest.title}" (${newest.createdAt})`);
-        log(`   Tổng cộng ${entries.length} video đang chờ`);
+        // Try to lock one of the newest files (up to 15 files to support 10-20 parallel channels)
+        let selectedEntry = null;
+        let lockAcquiredEarly = false;
+        const tryCount = Math.min(entries.length, 15);
+        
+        log(`🔍 Đang tìm file chưa bị khoá trong top ${tryCount} file mới nhất...`);
+        for (let i = entries.length - 1; i >= entries.length - tryCount; i--) {
+          const entry = entries[i];
+          const locked = await api.lockFile(entry.videoPath, channel.id);
+          if (locked) {
+            selectedEntry = entry;
+            lockAcquiredEarly = true;
+            break;
+          } else {
+            // log(`🔒 Bỏ qua ${entry.videoPath.split('/').pop()} (đã bị lock)`);
+          }
+        }
 
-        // Override job metadata with freshest scan data
-        uploadTitle = newest.title;
-        uploadDescription = newest.description;
-        uploadVisibility = (newest.visibility as 'public' | 'unlisted' | 'private') || 'public';
-        remoteVideoPath = newest.videoPath;
-        remoteThumbnailPath = newest.thumbnailPath;
-        remoteMetadataPath = newest.metadataPath;
+        if (!selectedEntry) {
+          log(`⚠️ Tất cả ${tryCount} file mới nhất đều đang bị xử lý bởi kênh khác.`);
+          await api.reportResult(job.id, 'FAILED', 'All newest files locked by other channels');
+          activeUploads.delete(channel.id);
+          return;
+        }
+
+        log(`📌 ĐÃ CHỐT VIDEO: "${selectedEntry.title}" (${selectedEntry.createdAt})`);
+        log(`   Tổng cộng ${entries.length} file trên Nextcloud`);
+
+        // Override job metadata with the selected unlocked file data
+        uploadTitle = selectedEntry.title;
+        uploadDescription = selectedEntry.description;
+        uploadVisibility = (selectedEntry.visibility as 'public' | 'unlisted' | 'private') || 'public';
+        remoteVideoPath = selectedEntry.videoPath;
+        remoteThumbnailPath = selectedEntry.thumbnailPath;
+        remoteMetadataPath = selectedEntry.metadataPath;
       } else {
         log(`⚠️ Không còn video nào trên Nextcloud cho channel "${channel.name}"`);
         await api.reportResult(job.id, 'FAILED', 'No videos available on Nextcloud');
@@ -363,9 +386,10 @@ async function processJob(
     // Cleanup downloaded files
     if (downloadedFile) cleanupDownload(downloadedFile);
     if (thumbPath && thumbPath !== job.thumbPath) cleanupDownload(thumbPath);
-    // Release file lock (unlock after done or fail)
+    // Release file lock ONLY IF we didn't delete it from Nextcloud
+    // If it was deleted, keep it locked so other channels don't try to download it and get 404
     const effectiveRemoteVideoFinal = remoteVideoPath || job.remoteVideoPath;
-    if (effectiveRemoteVideoFinal) {
+    if (effectiveRemoteVideoFinal && !nextcloudCleaned) {
       await api.unlockFile(effectiveRemoteVideoFinal, channel.id);
     }
     activeUploads.delete(channel.id);
