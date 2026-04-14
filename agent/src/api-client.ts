@@ -283,14 +283,14 @@ export class ApiClient {
   }
 
   /**
-   * Release a file lock after upload completes or fails.
+   * Unlock a file. If deleted = true, sets lock expiry to far future.
    */
-  async unlockFile(remoteVideoPath: string, channelId: number): Promise<void> {
+  async unlockFile(remoteVideoPath: string, channelId: number, deleted: boolean = false): Promise<void> {
     try {
       await fetch(`${this.serverUrl}/api/agent/unlock-file`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...this.headers },
-        body: JSON.stringify({ remoteVideoPath, channelId }),
+        body: JSON.stringify({ remoteVideoPath, channelId, deleted }),
       });
     } catch {
       // Silent fail — non-critical

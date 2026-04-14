@@ -386,11 +386,10 @@ async function processJob(
     // Cleanup downloaded files
     if (downloadedFile) cleanupDownload(downloadedFile);
     if (thumbPath && thumbPath !== job.thumbPath) cleanupDownload(thumbPath);
-    // Release file lock ONLY IF we didn't delete it from Nextcloud
-    // If it was deleted, keep it locked so other channels don't try to download it and get 404
+    // Release file lock (if deleted, it sets lock to far future to prevent 404s)
     const effectiveRemoteVideoFinal = remoteVideoPath || job.remoteVideoPath;
-    if (effectiveRemoteVideoFinal && !nextcloudCleaned) {
-      await api.unlockFile(effectiveRemoteVideoFinal, channel.id);
+    if (effectiveRemoteVideoFinal) {
+      await api.unlockFile(effectiveRemoteVideoFinal, channel.id, nextcloudCleaned);
     }
     activeUploads.delete(channel.id);
   }
