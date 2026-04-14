@@ -1,0 +1,123 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String        @id @default(cuid())
+  email        String        @unique
+  name         String?
+  passwordHash String
+  agentToken   String        @unique @default(cuid())
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  channels     Channel[]
+  settings     UserSettings?
+}
+
+model UserSettings {
+  id                  Int       @id @default(autoincrement())
+  userId              String    @unique
+  gologinToken        String?
+  nextcloudUrl        String?
+  nextcloudUsername   String?
+  nextcloudPassword   String?
+  autoUploadEnabled   Boolean   @default(false)
+  maxConcurrent       Int       @default(3)
+  agentActiveUploads  Int       @default(0)
+  agentLastSeen       DateTime?
+  agentMessage        String?
+  agentStatus         String?
+  agentVersion        String?
+  agentActiveProfiles String?
+
+  // Telegram Notification (Global per user)
+  telegramBotToken    String?
+  telegramChatId      String?
+  telegramEnabled     Boolean   @default(false)
+  telegramReportCron  Int       @default(30)
+  telegramLastReport  DateTime?
+
+  // Stats Collection
+  statsCollectInterval Int      @default(120)
+  statsLastCollect     DateTime?
+
+  user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Channel {
+  id               Int       @id @default(autoincrement())
+  userId           String
+  name             String
+  slug             String?
+  gologinProfileId String?
+  studioUrl        String?
+  nextcloudFolder  String?
+  uploadEnabled    Boolean   @default(true)
+  uploadVisibility String    @default("public")
+  uploadStartHour  Int       @default(8)
+  uploadEndHour    Int       @default(22)
+  uploadInterval   Int       @default(30)
+  isLoggedIn       Boolean   @default(false)
+  lastUpload       DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  uploads          Upload[]
+  stats            ChannelStats[]
+
+  @@unique([userId, name])
+}
+
+model Upload {
+  id                  Int       @id @default(autoincrement())
+  channelId           Int
+  title               String
+  description         String?
+  tags                String?
+  videoPath           String?
+  thumbPath           String?
+  remoteVideoPath     String?
+  remoteThumbnailPath String?
+  visibility          String    @default("public")
+  status              String    @default("PENDING")
+  youtubeUrl          String?
+  youtubeId           String?
+  error               String?
+  scheduledAt         DateTime?
+  uploadedAt          DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  // File lock — prevents two channels downloading the same Nextcloud file
+  lockedByChannelId   Int?
+  lockedAt            DateTime?
+
+  channel             Channel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@index([remoteVideoPath])
+}
+
+model ChannelStats {
+  id                  Int       @id @default(autoincrement())
+  channelId           Int
+  subscriberCount     Int?
+  totalViews          BigInt?
+  viewsLast28Days     Int?
+  viewsLast48Hours    Int?
+  videoCount          Int?
+  estimatedRevenue    Float?
+  revenueMonth        Float?
+  monetizationEnabled Boolean?
+  topVideoViews       Int?
+  topVideoTitle       String?
+  collectedAt         DateTime  @default(now())
+  channel             Channel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@index([channelId, collectedAt])
+  @@index([collectedAt])
+}

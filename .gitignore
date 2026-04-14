@@ -1,0 +1,71 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files
+.env*
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# Agent build output
+/agent/dist/
+/agent/node_modules/
+
+# Dev/debug scripts (not for production)
+__*.js
+__*.mjs
+_*.js
+_*.mjs
+e2e_test.mjs
+script.js
+
+# Temp/reference folders
+__youtube-uploader-temp/
+youtube-uploader-ref/
+everything-claude-code/
+
+# Antigravity Kit (AI agent tools - not part of project)
+.agent/
+.claude/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# SQLite dev database (PostgreSQL used in production)
+prisma/dev.db
+prisma/*.db
+
