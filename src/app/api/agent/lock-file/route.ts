@@ -5,13 +5,17 @@ const LOCK_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 /**
  * POST /api/agent/lock-file
- * Atomically lock a Nextcloud file path for a specific channel.
- *
- * Uses a single conditional UPDATE (not SELECT + UPDATE) to prevent
- * TOCTOU race conditions when two channels request the same file simultaneously.
- * PostgreSQL row-level locking ensures only one channel wins.
- *
- * Returns { success: true } if lock acquired, { success: false } if already locked.
+ * 
+ * GLOBAL file lock across ALL channels sharing the same Nextcloud folder.
+ * 
+ * Problem: Multiple channels (news 4, news 6, news 7, ...) share the same
+ * Nextcloud folder (ks-news). Each channel has its OWN Upload record for
+ * the same file. The old per-record lock only locked ONE channel's record,
+ * allowing other channels to "lock" their own record and download a file
+ * that was already being processed (or deleted) by another channel → 404.
+ * 
+ * Solution: Before locking, check ALL Upload records for this file path
+ * across ALL channels. If ANY other channel has a valid lock → deny.
  */
 export async function POST(request: Request) {
   const authHeader = request.headers.get("authorization");
@@ -32,16 +36,44 @@ export async function POST(request: Request) {
 
   const lockExpiry = new Date(Date.now() - LOCK_TTL_MS);
 
-  // Single atomic UPDATE: only succeeds if not locked by another channel (or lock expired).
-  // If two requests arrive simultaneously, PostgreSQL row-level lock ensures only one wins.
+  // ══════════════════════════════════════════════════════════════
+  // STEP 1: GLOBAL CHECK — Is ANY other channel holding a valid lock?
+  // This looks across ALL Upload records for this file, not just
+  // the requesting channel's record.
+  // ══════════════════════════════════════════════════════════════
+  const conflictingLock = await prisma.upload.findFirst({
+    where: {
+      remoteVideoPath,
+      channel: { userId: user.id },
+      lockedAt: { gte: lockExpiry },    // lock is still valid (not expired)
+      NOT: [
+        { lockedByChannelId: null },    // must have a lock holder
+        { lockedByChannelId: channelId }, // ignore self-locks (idempotent)
+      ],
+    },
+  });
+
+  if (conflictingLock) {
+    return NextResponse.json({ 
+      success: false, 
+      reason: "locked_by_other",
+      lockedBy: conflictingLock.lockedByChannelId 
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  // STEP 2: LOCK — No conflict found. Lock THIS channel's record.
+  // Also lock ALL records for this file (across all channels)
+  // to prevent any other channel from claiming it.
+  // ══════════════════════════════════════════════════════════════
   const result = await prisma.upload.updateMany({
     where: {
       remoteVideoPath,
       channel: { userId: user.id },
       OR: [
-        { lockedByChannelId: null },           // not locked
-        { lockedByChannelId: channelId },       // already locked by same channel (idempotent)
-        { lockedAt: { lt: lockExpiry } },       // lock expired (TTL = 10 min)
+        { lockedByChannelId: null },       // not locked
+        { lockedByChannelId: channelId },   // already locked by same channel
+        { lockedAt: { lt: lockExpiry } },   // lock expired
       ],
     },
     data: {
@@ -51,9 +83,8 @@ export async function POST(request: Request) {
   });
 
   if (result.count === 0) {
-    // No rows updated → locked by another channel
-    return NextResponse.json({ success: false, reason: "locked_by_other" });
+    return NextResponse.json({ success: false, reason: "no_matching_record" });
   }
 
-  return NextResponse.json({ success: true });
+  return NextResponse.json({ success: true, lockedRecords: result.count });
 }

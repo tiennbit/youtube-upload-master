@@ -3,7 +3,14 @@ import prisma from "@/lib/prisma";
 
 /**
  * POST /api/agent/unlock-file
- * Release the lock on a file after upload completes or fails.
+ * 
+ * Release or permanently lock a file across ALL channels.
+ * 
+ * When deleted=true: Sets lock expiry to year 2099 on ALL records for this file.
+ * This ensures no other channel can ever re-lock a deleted file (prevents 404s).
+ * 
+ * When deleted=false: Releases the lock on ALL records for this file,
+ * allowing other channels to pick it up.
  */
 export async function POST(request: Request) {
   const authHeader = request.headers.get("authorization");
@@ -24,8 +31,8 @@ export async function POST(request: Request) {
 
   if (deleted) {
     // File was permanently deleted from Nextcloud.
-    // Set lockedAt to the far future so this lock NEVER expires.
-    // This prevents other channels from re-locking it and getting 404s.
+    // Lock ALL records for this file (across ALL channels) with far-future expiry.
+    // This prevents ANY channel from trying to download it → no more 404s.
     const farFuture = new Date("2099-12-31T23:59:59.000Z");
     await prisma.upload.updateMany({
       where: {
@@ -38,7 +45,8 @@ export async function POST(request: Request) {
       },
     });
   } else {
-    // Release the lock (download failed, file still exists)
+    // Release the lock on ALL records for this file (download failed, file still exists).
+    // Only release locks held by this channel.
     await prisma.upload.updateMany({
       where: {
         remoteVideoPath,

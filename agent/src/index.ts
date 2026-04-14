@@ -344,6 +344,13 @@ async function processJob(
         }
       );
       log(`🗑️ Đã xóa bộ video trên Nextcloud (trước upload): ${baseName}`);
+      
+      // PERMANENT LOCK: Immediately tell the server this file is deleted.
+      // This sets lock expiry to the Year 2099, preventing any 10-minute TTL expiry 
+      // from letting other channels grab this file while we are uploading it.
+      await api.unlockFile(cleanupVideoPath, channel.id, true);
+      log(`🔒 File lock vĩnh viễn (đã xoá), ngăn các kênh khác lấy file gây 404.`);
+      
       nextcloudCleaned = true;
     } catch (err: any) {
       log(`⚠️ Lỗi xóa files trên Nextcloud: ${err.message}`);
@@ -386,10 +393,11 @@ async function processJob(
     // Cleanup downloaded files
     if (downloadedFile) cleanupDownload(downloadedFile);
     if (thumbPath && thumbPath !== job.thumbPath) cleanupDownload(thumbPath);
-    // Release file lock (if deleted, it sets lock to far future to prevent 404s)
+    // Release file lock ONLY IF we didn't delete it (i.e. download failed).
+    // If deleted, it was already permanently locked earlier.
     const effectiveRemoteVideoFinal = remoteVideoPath || job.remoteVideoPath;
-    if (effectiveRemoteVideoFinal) {
-      await api.unlockFile(effectiveRemoteVideoFinal, channel.id, nextcloudCleaned);
+    if (effectiveRemoteVideoFinal && !nextcloudCleaned) {
+      await api.unlockFile(effectiveRemoteVideoFinal, channel.id, false);
     }
     activeUploads.delete(channel.id);
   }
