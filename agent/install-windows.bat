@@ -1,54 +1,81 @@
 @echo off
-title TubeFlow Agent Installer
+chcp 65001 >nul
+title TubeFlow Agent — Cai Dat
+color 0A
+
 echo.
-echo ========================================
-echo   TubeFlow Desktop Agent - Cai Dat
-echo ========================================
+echo  =============================================
+echo    TubeFlow Desktop Agent v1.0 - Cai Dat
+echo  =============================================
+echo.
+echo  Huong dan cai dat: xem file INSTALL-WINDOWS.md
 echo.
 
-:: Check Node.js
+:: ──────────────────────────────────────
+:: KIEM TRA NODE.JS
+:: ──────────────────────────────────────
+echo [1/4] Kiem tra Node.js...
 where node >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [!] Node.js chua duoc cai dat!
-    echo     Tai va cai dat tu: https://nodejs.org
-    echo     Chon phien ban LTS ^(khuyen nghi^)
+    echo.
+    echo  [!] Node.js CHUA duoc cai dat!
+    echo.
+    echo      Vui long:
+    echo      1. Truy cap https://nodejs.org
+    echo      2. Tai phien ban LTS
+    echo      3. Cai dat xong roi chay lai file nay
     echo.
     pause
     start https://nodejs.org
     exit /b 1
 )
 
-echo [OK] Node.js da cai dat
-for /f "tokens=*" %%i in ('node -v') do echo     Phien ban: %%i
+for /f "tokens=*" %%i in ('node -v') do set NODE_VER=%%i
+echo  [OK] Node.js %NODE_VER% da san sang
 echo.
 
-:: Install dependencies
-echo [*] Dang cai dat dependencies...
+:: ──────────────────────────────────────
+:: CAI DEPENDENCIES
+:: ──────────────────────────────────────
+echo [2/4] Cai dat thu vien (co the mat 1-2 phut)...
 cd /d "%~dp0"
-call npm install
+call npm install --silent
 if %errorlevel% neq 0 (
-    echo [!] Loi cai dat dependencies!
+    echo.
+    echo  [!] Loi cai dat! Kiem tra ket noi Internet va thu lai.
+    echo.
     pause
     exit /b 1
 )
-echo [OK] Dependencies da cai dat
+echo  [OK] Thu vien da cai dat
 echo.
 
-:: Build TypeScript
-echo [*] Dang build agent...
-call npm run build
+:: ──────────────────────────────────────
+:: BUILD AGENT
+:: ──────────────────────────────────────
+echo [3/4] Build agent...
+call npm run build --silent
 if %errorlevel% neq 0 (
-    echo [!] Loi build!
+    echo.
+    echo  [!] Loi build! Lien he admin de duoc ho tro.
+    echo.
     pause
     exit /b 1
 )
-echo [OK] Build thanh cong
+echo  [OK] Build thanh cong
 echo.
 
-:: Run agent
-echo ========================================
-echo   Khoi dong TubeFlow Agent...
-echo ========================================
+:: ──────────────────────────────────────
+:: KHOI DONG AGENT
+:: ──────────────────────────────────────
+echo [4/4] Khoi dong TubeFlow Agent...
+echo.
+echo  =============================================
+echo    Agent dang chay. De dung: Ctrl + C
+echo  =============================================
 echo.
 node dist/index.js
+
+echo.
+echo  Agent da dung.
 pause
