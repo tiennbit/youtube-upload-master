@@ -17,17 +17,25 @@ export async function POST(request: Request) {
   }
 
   const body = await request.json().catch(() => ({}));
-  const rawIds = Array.isArray(body.jobIds) ? body.jobIds : [];
-  const jobIds = rawIds
-    .map((v: unknown) => Number(v))
-    .filter((v: number) => Number.isFinite(v))
-    .map((v: number) => Math.floor(v));
+  const rawIds: unknown[] = Array.isArray(body.jobIds) ? body.jobIds : [];
+  const jobIds: number[] = [];
+  for (const v of rawIds) {
+    const n = Number(v);
+    if (Number.isFinite(n)) jobIds.push(Math.floor(n));
+  }
 
   if (jobIds.length === 0) {
     return NextResponse.json({ deleted: 0, error: "jobIds required" }, { status: 400 });
   }
 
-  const uniqueIds = [...new Set(jobIds)].slice(0, 1000);
+  const uniqueIds: number[] = [];
+  const seen = new Set<number>();
+  for (const id of jobIds) {
+    if (!seen.has(id) && uniqueIds.length < 1000) {
+      seen.add(id);
+      uniqueIds.push(id);
+    }
+  }
 
   const deleted = await prisma.upload.deleteMany({
     where: {
