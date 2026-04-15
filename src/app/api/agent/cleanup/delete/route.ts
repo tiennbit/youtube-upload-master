@@ -27,7 +27,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ deleted: 0, error: "jobIds required" }, { status: 400 });
   }
 
-  const uniqueIds: number[] = Array.from(new Set(jobIds)).slice(0, 1000);
+  const uniqueIds = [...new Set(jobIds)].slice(0, 1000);
 
   const deleted = await prisma.upload.deleteMany({
     where: {
