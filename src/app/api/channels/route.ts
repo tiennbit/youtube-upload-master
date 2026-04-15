@@ -28,8 +28,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Tên channel là bắt buộc" }, { status: 400 });
     }
 
-    if (!body.studioUrl || !/^https:\/\/studio\.youtube\.com\/channel\/UC/.test(body.studioUrl)) {
-      return NextResponse.json({ error: "Studio URL bắt buộc và phải có dạng: https://studio.youtube.com/channel/UC..." }, { status: 400 });
+    if (body.studioUrl && !/^https:\/\/studio\.youtube\.com\/channel\/UC/.test(body.studioUrl)) {
+      return NextResponse.json({ error: "Studio URL phải có dạng: https://studio.youtube.com/channel/UC..." }, { status: 400 });
     }
 
     const channel = await prisma.channel.create({
@@ -38,7 +38,7 @@ export async function POST(request: Request) {
         name: body.name,
         slug: body.slug || null,
         gologinProfileId: body.gologinProfileId || null,
-        studioUrl: body.studioUrl,
+        studioUrl: body.studioUrl || null,
         nextcloudFolder: body.nextcloudFolder || null,
         uploadVisibility: body.uploadVisibility || "public",
         uploadStartHour: body.uploadStartHour ?? 8,

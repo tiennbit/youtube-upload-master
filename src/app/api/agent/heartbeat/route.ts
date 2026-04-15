@@ -17,6 +17,25 @@ export async function POST(request: Request) {
 
   const body = await request.json().catch(() => ({}));
 
+  // Check if agent just restarted; if so, clear out all stuck UPLOADING jobs
+  if (body.isRestart) {
+    try {
+      const resetCount = await prisma.upload.updateMany({
+        where: {
+          channel: { userId: user.id },
+          status: "UPLOADING"
+        },
+        data: {
+          status: "FAILED",
+          error: "Agent restarted: job auto-reset from UPLOADING"
+        }
+      });
+      if (resetCount.count > 0) {
+        console.log(`[Heartbeat] Agent restart detected - reset ${resetCount.count} stuck UPLOADING jobs to FAILED`);
+      }
+    } catch {}
+  }
+
   try {
     const activeProfiles = JSON.stringify(body.activeProfiles || []);
     // Use raw SQL to work even if Prisma client hasn't regenerated

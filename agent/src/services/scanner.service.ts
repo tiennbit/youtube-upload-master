@@ -50,7 +50,12 @@ async function listFolder(
   password: string,
   folderPath: string
 ): Promise<RemoteFile[]> {
-  const davUrl = `${baseUrl}/remote.php/dav/files/${username}/${folderPath}`;
+  const encodedFolder = folderPath
+    .replace(/^\//, '')
+    .split('/')
+    .map((seg) => encodeURIComponent(seg))
+    .join('/');
+  const davUrl = `${baseUrl}/remote.php/dav/files/${encodeURIComponent(username)}/${encodedFolder}`;
 
   const response = await axios({
     method: 'PROPFIND',
@@ -104,7 +109,12 @@ async function downloadMetadataJSON(
   password: string,
   remotePath: string
 ): Promise<Record<string, any> | null> {
-  const davUrl = `${baseUrl}/remote.php/dav/files/${username}/${remotePath}`;
+  const encodedPath = remotePath
+    .replace(/^\//, '')
+    .split('/')
+    .map((seg) => encodeURIComponent(seg))
+    .join('/');
+  const davUrl = `${baseUrl}/remote.php/dav/files/${encodeURIComponent(username)}/${encodedPath}`;
   try {
     const res = await axios.get(davUrl, {
       auth: { username, password },
@@ -288,7 +298,12 @@ export async function deleteFromNextcloud(
 ): Promise<void> {
   const baseUrl = nextcloudUrl.replace(/\/$/, '');
   const cleanPath = remotePath.replace(/^\//, '');
-  const davUrl = `${baseUrl}/remote.php/dav/files/${username}/${cleanPath}`;
+  const encodedPath = cleanPath
+    .replace(/^\//, '')
+    .split('/')
+    .map((seg) => encodeURIComponent(seg))
+    .join('/');
+  const davUrl = `${baseUrl}/remote.php/dav/files/${encodeURIComponent(username)}/${encodedPath}`;
 
   console.log(`[Scanner] Xóa file Nextcloud: ${cleanPath}`);
 
@@ -317,4 +332,39 @@ export async function deleteVideoBundle(
       console.log(`[Scanner] ⚠️ Không thể xóa ${path.basename(p)}: ${err.message}`);
     }
   }
+}
+
+export interface DeleteBundleStats {
+  attemptedFiles: number;
+  deletedFiles: number;
+  failedFiles: number;
+}
+
+/**
+ * Same behavior as deleteVideoBundle, but returns stats for cleanup reporting.
+ */
+export async function deleteVideoBundleWithStats(
+  nextcloudUrl: string,
+  username: string,
+  password: string,
+  entry: Pick<VideoEntry, 'videoPath' | 'thumbnailPath' | 'metadataPath'>
+): Promise<DeleteBundleStats> {
+  const paths = [entry.videoPath, entry.thumbnailPath, entry.metadataPath].filter(Boolean) as string[];
+  const stats: DeleteBundleStats = {
+    attemptedFiles: paths.length,
+    deletedFiles: 0,
+    failedFiles: 0,
+  };
+
+  for (const p of paths) {
+    try {
+      await deleteFromNextcloud(nextcloudUrl, username, password, p);
+      stats.deletedFiles += 1;
+    } catch (err: any) {
+      stats.failedFiles += 1;
+      console.log(`[Scanner] Cleanup skip ${path.basename(p)}: ${err.message}`);
+    }
+  }
+
+  return stats;
 }

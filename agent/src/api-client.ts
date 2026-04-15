@@ -1,5 +1,5 @@
 /**
- * TubeFlow Agent — API Client
+ * TubeFlow Agent - API Client
  * Communicates with the TubeFlow server to fetch jobs and report results
  */
 
@@ -26,17 +26,19 @@ export interface JobData {
   };
 }
 
+export interface AgentSettings {
+  gologinToken: string | null;
+  nextcloudUrl: string | null;
+  nextcloudUsername: string | null;
+  nextcloudPassword: string | null;
+  maxConcurrent: number;
+  autoUploadEnabled: boolean;
+}
+
 export interface JobResponse {
   job: JobData | null;
   reason?: string;
-  settings?: {
-    gologinToken: string | null;
-    nextcloudUrl: string | null;
-    nextcloudUsername: string | null;
-    nextcloudPassword: string | null;
-    maxConcurrent: number;
-    autoUploadEnabled: boolean;
-  } | null;
+  settings?: AgentSettings | null;
 }
 
 export interface ChannelInfo {
@@ -46,6 +48,15 @@ export interface ChannelInfo {
   uploadEnabled: boolean;
   gologinProfileId: string | null;
   lastUpload: string | null;
+}
+
+export interface ExpiredUploadCandidate {
+  id: number;
+  channelId: number;
+  remoteVideoPath: string | null;
+  remoteThumbnailPath: string | null;
+  createdAt: string;
+  status: string;
 }
 
 export class ApiClient {
@@ -71,7 +82,7 @@ export class ApiClient {
     });
 
     if (res.status === 401) {
-      throw new Error('Agent Token không hợp lệ. Kiểm tra lại token trên web dashboard.');
+      throw new Error('Agent token is invalid. Please re-check token on dashboard.');
     }
 
     if (!res.ok) {
@@ -79,6 +90,23 @@ export class ApiClient {
     }
 
     return res.json() as Promise<JobResponse>;
+  }
+
+  async getSettings(): Promise<AgentSettings | null> {
+    const res = await fetch(`${this.serverUrl}/api/agent/settings`, {
+      headers: this.headers,
+    });
+
+    if (res.status === 401) {
+      throw new Error('Agent token is invalid. Please re-check token on dashboard.');
+    }
+
+    if (!res.ok) {
+      throw new Error(`Server error: ${res.status} ${res.statusText}`);
+    }
+
+    const data = await res.json() as { settings?: AgentSettings | null };
+    return data.settings ?? null;
   }
 
   async reportResult(jobId: number, status: 'DONE' | 'FAILED', error?: string, youtubeUrl?: string, youtubeId?: string): Promise<void> {
@@ -101,9 +129,6 @@ export class ApiClient {
     return res.json() as Promise<{ latestVersion: string; downloadUrl?: string }>;
   }
 
-  /**
-   * Get list of channels for scanning
-   */
   async getChannels(): Promise<ChannelInfo[]> {
     const res = await fetch(`${this.serverUrl}/api/agent/channels`, {
       headers: this.headers,
@@ -114,9 +139,6 @@ export class ApiClient {
     return data.channels || [];
   }
 
-  /**
-   * Report scanned files from Nextcloud to create upload jobs
-   */
   async reportScannedFiles(
     channelId: number,
     files: {
@@ -145,15 +167,13 @@ export class ApiClient {
     return res.json() as Promise<{ created: number; skipped: number }>;
   }
 
-  /**
-   * Send heartbeat to server (agent status reporting)
-   */
   async sendHeartbeat(data: {
     version: string;
     status: string;
     activeUploads: number;
     message?: string;
     activeProfiles?: string[];
+    isRestart?: boolean;
   }): Promise<void> {
     try {
       await fetch(`${this.serverUrl}/api/agent/heartbeat`, {
@@ -165,13 +185,10 @@ export class ApiClient {
         body: JSON.stringify(data),
       });
     } catch {
-      // Silent fail — heartbeat is non-critical
+      // Silent fail - heartbeat is non-critical
     }
   }
 
-  /**
-   * Update channel studioUrl (auto-detected after first upload)
-   */
   async updateChannelStudioUrl(channelId: number, studioUrl: string): Promise<void> {
     try {
       await fetch(`${this.serverUrl}/api/agent/channel-update`, {
@@ -183,13 +200,10 @@ export class ApiClient {
         body: JSON.stringify({ channelId, studioUrl }),
       });
     } catch {
-      // Silent fail — non-critical
+      // Silent fail - non-critical
     }
   }
 
-  /**
-   * Reset a job back to PENDING (when agent fetched but cannot process)
-   */
   async resetJob(jobId: number): Promise<void> {
     try {
       await fetch(`${this.serverUrl}/api/agent/report`, {
@@ -203,9 +217,6 @@ export class ApiClient {
     } catch {}
   }
 
-  /**
-   * Report scraped channel stats to server
-   */
   async reportChannelStats(stats: {
     channelId: number;
     subscriberCount?: number;
@@ -241,9 +252,6 @@ export class ApiClient {
     }
   }
 
-  /**
-   * Get stats collection settings (interval, last collect time)
-   */
   async getStatsSettings(): Promise<{
     statsCollectInterval: number;
     statsLastCollect: string | null;
@@ -263,10 +271,6 @@ export class ApiClient {
     }
   }
 
-  /**
-   * Lock a Nextcloud file for exclusive download by this channel.
-   * Returns true if lock acquired, false if already locked by another channel.
-   */
   async lockFile(remoteVideoPath: string, channelId: number): Promise<boolean> {
     try {
       const res = await fetch(`${this.serverUrl}/api/agent/lock-file`, {
@@ -274,17 +278,14 @@ export class ApiClient {
         headers: { 'Content-Type': 'application/json', ...this.headers },
         body: JSON.stringify({ remoteVideoPath, channelId }),
       });
-      if (!res.ok) return true; // fail-open: if server error, allow download
+      if (!res.ok) return true;
       const data = await res.json();
       return data.success === true;
     } catch {
-      return true; // fail-open: network error → allow download
+      return true;
     }
   }
 
-  /**
-   * Unlock a file. If deleted = true, sets lock expiry to far future.
-   */
   async unlockFile(remoteVideoPath: string, channelId: number, deleted: boolean = false): Promise<void> {
     try {
       await fetch(`${this.serverUrl}/api/agent/unlock-file`, {
@@ -293,7 +294,49 @@ export class ApiClient {
         body: JSON.stringify({ remoteVideoPath, channelId, deleted }),
       });
     } catch {
-      // Silent fail — non-critical
+      // Silent fail - non-critical
     }
+  }
+
+  async getCleanupCandidates(
+    before: string,
+    limit: number,
+    excludeChannelIds: number[]
+  ): Promise<{ candidates: ExpiredUploadCandidate[]; hasMore: boolean }> {
+    const query = new URLSearchParams({
+      before,
+      limit: String(limit),
+    });
+    if (excludeChannelIds.length > 0) {
+      query.set('excludeChannels', excludeChannelIds.join(','));
+    }
+
+    const res = await fetch(`${this.serverUrl}/api/agent/cleanup/candidates?${query.toString()}`, {
+      headers: this.headers,
+    });
+
+    if (!res.ok) {
+      throw new Error(`Cleanup candidates failed: ${res.status}`);
+    }
+
+    return res.json() as Promise<{ candidates: ExpiredUploadCandidate[]; hasMore: boolean }>;
+  }
+
+  async deleteCleanupJobs(jobIds: number[]): Promise<number> {
+    const res = await fetch(`${this.serverUrl}/api/agent/cleanup/delete`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...this.headers,
+      },
+      body: JSON.stringify({ jobIds }),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Cleanup delete failed: ${res.status}`);
+    }
+
+    const data = await res.json() as { deleted?: number };
+    return data.deleted ?? 0;
   }
 }

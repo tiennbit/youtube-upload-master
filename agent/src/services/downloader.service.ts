@@ -21,9 +21,15 @@ export async function downloadFromNextcloud(
   const fileName = path.basename(remotePath);
   const localPath = path.join(DOWNLOAD_DIR, `${Date.now()}_${fileName}`);
 
-  // Build WebDAV URL
+  // Build WebDAV URL — encode each path segment to handle Korean chars,
+  // brackets, quotes, spaces, etc. that cause 404 when sent raw.
   const baseUrl = nextcloudUrl.replace(/\/$/, '');
-  const davUrl = `${baseUrl}/remote.php/dav/files/${username}/${remotePath.replace(/^\//, '')}`;
+  const encodedPath = remotePath
+    .replace(/^\//, '')
+    .split('/')
+    .map((seg) => encodeURIComponent(seg))
+    .join('/');
+  const davUrl = `${baseUrl}/remote.php/dav/files/${encodeURIComponent(username)}/${encodedPath}`;
 
   console.log(`[Download] Đang tải: ${fileName}`);
   console.log(`[Download] URL: ${davUrl}`);

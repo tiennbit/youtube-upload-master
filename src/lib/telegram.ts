@@ -34,17 +34,25 @@ async function sendMessage(
       return false;
     }
     return true;
-  } catch (e: any) {
-    if (e.name === "AbortError") {
+  } catch (e: unknown) {
+    const err = e as { name?: string; message?: string };
+    if (err.name === "AbortError") {
       console.error("[Telegram] Request timed out (10 s)");
     } else {
-      console.error(`[Telegram] ${e.message}`);
+      console.error(`[Telegram] ${err.message || "Unknown error"}`);
     }
     return false;
   }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
 
 function now() {
   return new Date().toLocaleString("vi-VN", {
@@ -228,7 +236,6 @@ export async function sendPeriodicReport(userId: string): Promise<boolean> {
 
   // Agent status
   const agentStatus = settings.agentStatus || "offline";
-  const agentVer = settings.agentVersion || "?";
   const scrapeTime = settings.statsLastCollect
     ? new Date(settings.statsLastCollect).toLocaleTimeString("vi-VN", {
         timeZone: "Asia/Ho_Chi_Minh",
@@ -267,6 +274,51 @@ export async function sendAlert(
     alertText,
     ``,
     now(),
+  ].join("\n");
+
+  return sendMessage(settings.telegramBotToken, settings.telegramChatId, text);
+}
+
+/**
+ * Send a success notification when one video upload completes.
+ * "Tong da dang trong ngay" is counted per-channel.
+ */
+export async function sendUploadSuccess(
+  userId: string,
+  payload: {
+    channelName: string;
+    youtubeUrl: string;
+    totalUploadedToday: number;
+    uploadedAt: Date;
+  }
+): Promise<boolean> {
+  const settings = await prisma.userSettings.findUnique({
+    where: { userId },
+  });
+  if (
+    !settings?.telegramEnabled ||
+    !settings.telegramBotToken ||
+    !settings.telegramChatId
+  ) {
+    return false;
+  }
+
+  const postedAt = payload.uploadedAt.toLocaleString("vi-VN", {
+    timeZone: "Asia/Ho_Chi_Minh",
+    hour: "2-digit",
+    minute: "2-digit",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  });
+
+  const text = [
+    "✅ Upload thành công!",
+    "",
+    `📺 Kênh: <b>${escapeHtml(payload.channelName)}</b>`,
+    `🎬 Link video: ${escapeHtml(payload.youtubeUrl)}`,
+    `📊 Tổng đã đăng trong ngày: <b>${payload.totalUploadedToday}</b>`,
+    `⏰ Thời gian đăng thành công: ${postedAt}`,
   ].join("\n");
 
   return sendMessage(settings.telegramBotToken, settings.telegramChatId, text);

@@ -732,12 +732,16 @@ export async function uploadVideo(
 
     await delay(2000);
 
-    // Step 11: Wait for YouTube to finish uploading AND checks
-    // Phase 1: Wait for upload to complete (Done button enabled + not uploading) — max 5 min
-    // Phase 2: Wait for Checks to complete — max 3 min extra
-    console.log('[Upload] Step 11: Wait for upload + checks...');
+    // Step 11: UNIFIED wait loop — wait for Done button to become clickable, then click it
+    // This replaces the old Phase 1 + Phase 2 + Step 12 which had a critical bug:
+    // Phase 2 was SKIPPED when Phase 1 timed out, giving only 13 min total wait
+    // instead of the 20+ min needed for large videos.
+    //
+    // New logic: single loop, check every 15s, max 20 min (80 iterations × 15s)
+    // When Done button is enabled → click immediately
+    console.log('[Upload] Step 11: Waiting for upload + checks + Done button (max 20 min)...');
     let sessionAlive = true;
-    let doneButtonReady = false;
+    let saveClicked = false;
 
     // Helper: get detailed upload/check status from YouTube Studio UI
     const getUploadStatus = async () => {
@@ -745,9 +749,6 @@ export async function uploadVideo(
         const body = document.body?.innerText || '';
         const uploading = body.includes('Uploading') || body.includes('Đang tải lên');
 
-        // Detect checks status using the progress row text (NOT the tab label)
-        // YouTube Studio shows a progress row like: "Checks  In progress" or "Checks  None found"
-        // The tab label "Checks" appears on ALL pages, so we need the status text
         const progressRows = Array.from(document.querySelectorAll(
           '.progress-label, .label, .ytcp-video-upload-progress, [class*="progress"]'
         ));
@@ -755,11 +756,9 @@ export async function uploadVideo(
         let checksComplete = false;
         for (const row of progressRows) {
           const text = (row.textContent || '').trim();
-          // "Checking" / "Đang kiểm tra" in a progress context = still running
           if (text.includes('Checking') || text.includes('Đang kiểm tra')) {
             checksInProgress = true;
           }
-          // "No issues found" / "Không tìm thấy vấn đề" / "Complete" = done
           if (text.includes('No issues') || text.includes('Không tìm thấy')
             || text.includes('Complete') || text.includes('Hoàn tất')
             || text.includes('None found') || text.includes('issues found')) {
@@ -767,8 +766,6 @@ export async function uploadVideo(
           }
         }
 
-        // Fallback: also check the step badge / status indicator
-        // YouTube shows copyright check status in a specific container
         const checkStepStatus = document.querySelector('#checks-step, [step="STEP_REVIEW"]');
         if (checkStepStatus) {
           const stepText = (checkStepStatus.textContent || '').trim();
@@ -782,33 +779,104 @@ export async function uploadVideo(
           }
         }
 
-        // If we found both "in progress" and "complete" markers, trust "complete"
         if (checksComplete) checksInProgress = false;
 
         const doneBtn = document.querySelector('#done-button') as HTMLElement;
         const btnDisabled = doneBtn?.hasAttribute('disabled') || doneBtn?.getAttribute('aria-disabled') === 'true';
+        const btnExists = !!doneBtn;
 
-        return { uploading, checksInProgress, checksComplete, btnDisabled };
-      }, { uploading: false, checksInProgress: false, checksComplete: false, btnDisabled: true });
+        return { uploading, checksInProgress, checksComplete, btnDisabled, btnExists };
+      }, { uploading: false, checksInProgress: false, checksComplete: false, btnDisabled: true, btnExists: false });
     };
 
-    // Phase 1: Wait for upload to finish (max 8 min = 48 × 10s)
-    console.log('[Upload] Phase 1: Waiting for upload to complete...');
-    for (let i = 0; i < 48; i++) {
-      await delay(10000);
+    // Helper: try to click Done button, returns true if succeeded
+    const tryClickDone = async (): Promise<boolean> => {
+      try {
+        const result = await page.evaluate(() => {
+          const selectors = ['#done-button', 'ytcp-button#done-button'];
+          for (const sel of selectors) {
+            const btn = document.querySelector(sel) as HTMLElement;
+            if (btn && btn.offsetParent !== null) {
+              const disabled = btn.hasAttribute('disabled') || btn.getAttribute('aria-disabled') === 'true';
+              if (!disabled) {
+                btn.click();
+                return `clicked: ${sel}`;
+              }
+            }
+          }
+          // Fallback: find by text
+          const buttons = Array.from(document.querySelectorAll('ytcp-button, button'));
+          for (const btn of buttons) {
+            const text = (btn.textContent || '').trim();
+            if (text === 'Save' || text === 'Lưu' || text === 'Publish' || text === 'Xuất bản') {
+              (btn as HTMLElement).click();
+              return `clicked by text: ${text}`;
+            }
+          }
+          return 'not_ready';
+        });
+
+        if (result.startsWith('clicked')) {
+          console.log(`[Upload] ✅ Done/Save: ${result}`);
+          return true;
+        }
+        return false;
+      } catch {
+        return false;
+      }
+    };
+
+    // Unified loop: max 20 min = 80 × 15s
+    // IMPORTANT: require minimum 30s wait + 2 consecutive "ready" checks
+    // to avoid clicking Done during YouTube's brief transient enabled state
+    const MAX_WAIT_ITERATIONS = 80;
+    const MIN_WAIT_SECONDS = 30; // Don't click Done before this time
+    let lastLogState = '';
+    let consecutiveReady = 0; // Track consecutive "button enabled" checks
+    const loopStartTime = Date.now();
+
+    for (let i = 0; i < MAX_WAIT_ITERATIONS; i++) {
+      // First iteration: wait 10s, subsequent: wait 15s
+      await delay(i === 0 ? 10000 : 15000);
+
       try {
         const status = await getUploadStatus();
-        console.log(`[Upload] Upload check ${i + 1}/48: uploading=${status.uploading}, btnDisabled=${status.btnDisabled}, checksInProgress=${status.checksInProgress}`);
 
+        // Build state string for smart logging
+        const state = status.uploading ? 'uploading' :
+          status.btnDisabled ? (status.checksInProgress ? 'checks' : 'processing') :
+          'ready';
+
+        // Log state changes + periodic updates every 60s
+        if (state !== lastLogState || i % 4 === 0) {
+          const elapsed = Math.round((Date.now() - loopStartTime) / 1000);
+          console.log(`[Upload] [${elapsed}s] uploading=${status.uploading} checks=${status.checksInProgress} btnDisabled=${status.btnDisabled} ready=${consecutiveReady}/2`);
+          lastLogState = state;
+        }
+
+        // Track consecutive "ready" states (button enabled + not uploading)
         if (!status.btnDisabled && !status.uploading) {
-          doneButtonReady = true;
-          console.log('[Upload] ✅ Upload complete — Done button enabled');
-          break;
+          consecutiveReady++;
+        } else {
+          consecutiveReady = 0; // Reset if button becomes disabled again
+        }
+
+        // Click Done ONLY if:
+        // 1. Minimum 30s elapsed (avoid transient early-enabled state)
+        // 2. Button enabled for 2 consecutive checks (30s stable)
+        const elapsedMs = Date.now() - loopStartTime;
+        if (consecutiveReady >= 2 && elapsedMs >= MIN_WAIT_SECONDS * 1000) {
+          const clicked = await tryClickDone();
+          if (clicked) {
+            saveClicked = true;
+            console.log(`[Upload] ✅ Published! (after ~${Math.round(elapsedMs / 60000)} min)`);
+            break;
+          }
         }
       } catch (e: any) {
-        console.log(`[Upload] Keepalive ${i + 1}/48 failed: ${e.message?.substring(0, 80)}`);
+        console.log(`[Upload] Poll ${i + 1} error: ${e.message?.substring(0, 80)}`);
         if (e.message?.includes('WebSocket') || e.message?.includes('Target closed') || e.message?.includes('Session closed')) {
-          console.log('[Upload] ❌ Session lost — video sẽ bị lưu bản nháp!');
+          console.log('[Upload] ❌ Session lost!');
           sessionAlive = false;
           break;
         }
@@ -819,106 +887,173 @@ export async function uploadVideo(
       throw new Error('Session closed trước khi Save — video bị lưu bản nháp');
     }
 
-    if (!doneButtonReady) {
-      console.log('[Upload] ⚠️ Done button vẫn disabled sau 8 phút — thử click anyway');
-    }
-
-    // Phase 2: Wait for Checks to complete (max 8 min = 48 × 10s)
-    // Only wait if upload is ready but checks still running
-    if (doneButtonReady) {
-      console.log('[Upload] Phase 2: Waiting for Checks to complete...');
-      let checksResolved = false;
-      for (let i = 0; i < 48; i++) {
-        try {
-          const status = await getUploadStatus();
-
-          if (!status.checksInProgress) {
-            checksResolved = true;
-            if (status.checksComplete) {
-              console.log('[Upload] ✅ Checks complete — no issues found');
-            } else {
-              console.log('[Upload] ✅ No active checks detected — proceeding');
-            }
-            break;
-          }
-
-          console.log(`[Upload] Checks in progress... waiting (${i + 1}/48, ~${(i + 1) * 10}s)`);
-          await delay(10000);
-        } catch (e: any) {
-          console.log(`[Upload] Checks poll error: ${e.message?.substring(0, 80)}`);
-          if (e.message?.includes('WebSocket') || e.message?.includes('Target closed') || e.message?.includes('Session closed')) {
-            sessionAlive = false;
-            break;
-          }
-        }
-      }
-
-      if (!sessionAlive) {
-        throw new Error('Session closed trong khi chờ Checks — video bị lưu bản nháp');
-      }
-
-      if (!checksResolved) {
-        console.log('[Upload] ⚠️ Checks vẫn chưa xong sau 8 phút — publish anyway (YouTube sẽ tiếp tục check sau publish)');
-      }
-    }
-
-    // Step 12: Click Done/Save — MUST SUCCEED
-    console.log('[Upload] Step 12: Click Done/Save');
-    let saveClicked = false;
-    try {
-      const saveResult = await page.evaluate(() => {
-        const selectors = ['#done-button', 'ytcp-button#done-button'];
-        for (const sel of selectors) {
-          const btn = document.querySelector(sel) as HTMLElement;
-          if (btn && btn.offsetParent !== null) {
-            // Double-check not disabled
-            const disabled = btn.hasAttribute('disabled') || btn.getAttribute('aria-disabled') === 'true';
-            if (!disabled) {
-              btn.click();
-              return `clicked: ${sel}`;
-            } else {
-              return `disabled: ${sel}`;
-            }
-          }
-        }
-        // Fallback: find by text
-        const buttons = Array.from(document.querySelectorAll('ytcp-button, button'));
-        for (const btn of buttons) {
-          const text = (btn.textContent || '').trim();
-          if (text === 'Save' || text === 'Lưu' || text === 'Publish' || text === 'Xuất bản') {
-            (btn as HTMLElement).click();
-            return `clicked by text: ${text}`;
-          }
-        }
-        return 'Save button not found';
-      });
-      console.log(`[Upload] Save result: ${saveResult}`);
-      saveClicked = saveResult.startsWith('clicked');
-    } catch (e: any) {
-      console.error(`[Upload] ❌ Save click failed: ${e.message}`);
-    }
-
     if (!saveClicked) {
-      throw new Error('Done/Save button click thất bại — video bị lưu bản nháp');
+      // Last resort: try clicking anyway even if status says disabled
+      console.log('[Upload] ⚠️ 20 phút chưa click được Done — thử force click lần cuối...');
+      saveClicked = await tryClickDone();
+
+      if (!saveClicked) {
+        throw new Error('Done/Save button click thất bại sau 20 phút — video bị lưu bản nháp');
+      }
     }
 
     await delay(5000);
 
-    // Handle confirmation popup (Public → may ask to confirm)
+    // Step 12: Handle confirmation popup (Public → YouTube shows confirm dialog)
+    // THIS IS CRITICAL — without clicking the confirm button, video stays as Draft!
+    console.log('[Upload] Step 12: Handle confirmation popup...');
     try {
+      // Take screenshot BEFORE trying to click confirm (for debugging)
+      try {
+        const screenshotPath = require('path').join(
+          process.env.USERPROFILE || '', '.tubeflow', 'debug',
+          `confirm_popup_${Date.now()}.png`
+        );
+        require('fs').mkdirSync(require('path').dirname(screenshotPath), { recursive: true });
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        console.log(`[Upload] 📸 Confirm popup screenshot: ${screenshotPath}`);
+      } catch {}
+
       await delay(3000);
-      await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('ytcp-button, button'));
-        for (const btn of buttons) {
-          const text = (btn.textContent || '').trim().toLowerCase();
-          if (text === 'publish' || text === 'xuất bản' || text === 'save' || text === 'lưu') {
-            (btn as HTMLElement).click();
+
+      // Log ALL visible buttons for diagnosis
+      const buttonInfo = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('ytcp-button, button, ytcp-icon-button'));
+        return buttons
+          .filter(b => (b as HTMLElement).offsetParent !== null)
+          .map(b => ({
+            tag: b.tagName,
+            id: b.id || '',
+            text: (b.textContent || '').trim().substring(0, 50),
+            ariaLabel: b.getAttribute('aria-label') || '',
+          }));
+      });
+      console.log(`[Upload] Visible buttons: ${JSON.stringify(buttonInfo)}`);
+
+      // Try to click the confirm/publish button in the popup
+      if (visibility !== 'public') {
+        const confirmResult = await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('ytcp-button, button'));
+          const confirmTexts = ['save', 'lưu', '게시', '저장', 'done'];
+
+          for (const btn of buttons) {
+            const text = (btn.textContent || '').trim().toLowerCase();
+            const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
+            const isVisible = (btn as HTMLElement).offsetParent !== null;
+
+            if (!isVisible) continue;
+
+            for (const key of confirmTexts) {
+              if (text.includes(key) || ariaLabel.includes(key)) {
+                (btn as HTMLElement).click();
+                return `clicked confirm: "${text}" (matched: ${key})`;
+              }
+            }
+          }
+          return 'no confirm button found';
+        });
+        console.log(`[Upload] Confirm result: ${confirmResult}`);
+
+        // If no text match, try clicking #done-button again (some versions reuse it)
+        if (confirmResult.includes('not found')) {
+          console.log('[Upload] Trying #done-button again as confirm...');
+          const retryResult = await page.evaluate(() => {
+            const doneBtn = document.querySelector('#done-button') as HTMLElement;
+            if (doneBtn && doneBtn.offsetParent !== null) {
+              doneBtn.click();
+              return 'clicked #done-button again';
+            }
+            return 'no done button';
+          });
+          console.log(`[Upload] Retry confirm: ${retryResult}`);
+        }
+      }
+
+      // Public mode must explicitly hit "Publish" on the "still checking" modal.
+      if (visibility === 'public') {
+        let publishClicked = false;
+        for (let attempt = 1; attempt <= 4; attempt++) {
+          const publishState = await page.evaluate(() => {
+            const body = (document.body?.innerText || '').toLowerCase();
+            const hasCheckingModal =
+              body.includes("we're still checking your video") ||
+              body.includes('still checking your video') ||
+              body.includes('wait for our checks to finish');
+
+            const buttons = Array.from(document.querySelectorAll('ytcp-button, button'))
+              .filter((b) => (b as HTMLElement).offsetParent !== null);
+
+            for (const btn of buttons) {
+              const text = (btn.textContent || '').trim().toLowerCase();
+              const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+              const merged = `${text} ${aria}`;
+              if (merged.includes('change visibility')) continue;
+              if (
+                merged.includes('publish') ||
+                merged.includes('xuất bản') ||
+                merged.includes('게시') ||
+                merged.includes('게시하기')
+              ) {
+                (btn as HTMLElement).click();
+                return { hasCheckingModal, clicked: true, label: text || aria };
+              }
+            }
+            return { hasCheckingModal, clicked: false, label: '' };
+          });
+
+          if (publishState.clicked) {
+            publishClicked = true;
+            console.log(`[Upload] ✅ Publish confirmation clicked (${publishState.label})`);
             break;
           }
+          if (!publishState.hasCheckingModal) {
+            break;
+          }
+          console.log(`[Upload] Waiting publish button on checking modal... (${attempt}/4)`);
+          await delay(2000);
         }
-      });
-    } catch {}
+
+        if (!publishClicked) {
+          const stillCheckingModal = await page.evaluate(() => {
+            const body = (document.body?.innerText || '').toLowerCase();
+            return (
+              body.includes("we're still checking your video") ||
+              body.includes('still checking your video') ||
+              body.includes('wait for our checks to finish')
+            );
+          });
+          if (stillCheckingModal) {
+            throw new Error('Chưa bấm được nút Publish trên popup "still checking your video"');
+          }
+        }
+      }
+
+      await delay(3000);
+
+      // Take screenshot AFTER confirm attempt
+      try {
+        const screenshotPath2 = require('path').join(
+          process.env.USERPROFILE || '', '.tubeflow', 'debug',
+          `after_confirm_${Date.now()}.png`
+        );
+        await page.screenshot({ path: screenshotPath2, fullPage: true });
+        console.log(`[Upload] 📸 After confirm screenshot: ${screenshotPath2}`);
+      } catch {}
+    } catch (e: any) {
+      console.log(`[Upload] Confirm popup error: ${e.message?.substring(0, 80)}`);
+      throw e;
+    }
     await delay(5000);
+
+    if (visibility === 'public') {
+      const stillPrivate = await safeEvaluate(() => {
+        const text = (document.body?.innerText || '').toLowerCase();
+        return text.includes('saved as private') || text.includes('đã lưu ở chế độ riêng tư');
+      }, false);
+      if (stillPrivate) {
+        throw new Error('Video vẫn đang ở trạng thái "Saved as private" sau bước Publish');
+      }
+    }
 
     // Verify: check if dialog closed (means save was successful)
     let dialogClosed = false;
@@ -1011,6 +1146,10 @@ export async function uploadVideo(
 
     if (!videoId) {
       console.warn('[Upload] ⚠️ Could not extract YouTube video ID — upload likely succeeded but unverified');
+    }
+
+    if (videoId) {
+      videoUrl = `https://youtu.be/${videoId}`;
     }
 
     uploadSucceeded = true;

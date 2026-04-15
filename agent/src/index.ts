@@ -12,7 +12,7 @@ import { loadConfig, saveConfig } from './config';
 import { ApiClient, JobData } from './api-client';
 import { uploadVideo } from './services/youtube.service';
 import { downloadFromNextcloud, cleanupDownload } from './services/downloader.service';
-import { scanChannelFolder, deleteFromNextcloud, deleteVideoBundle } from './services/scanner.service';
+import { scanChannelFolder, deleteFromNextcloud, deleteVideoBundle, deleteVideoBundleWithStats } from './services/scanner.service';
 import { stopAll, getActiveProfileIds } from './services/gologin.service';
 import { scrapeChannelStats } from './services/youtube-analytics.service';
 
@@ -20,6 +20,10 @@ const AGENT_VERSION = '1.0.0';
 const POLL_INTERVAL = 30000; // 30 seconds
 const SCAN_INTERVAL = 120000; // 2 minutes
 const DEFAULT_STATS_INTERVAL = 2 * 60 * 60 * 1000; // 2 hours
+const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
+const RETENTION_HOURS = 72;
+const CLEANUP_BATCH_SIZE = 200;
+const CLEANUP_FILE_CONCURRENCY = 4;
 
 function log(msg: string) {
   const time = new Date().toLocaleTimeString('vi-VN');
@@ -163,6 +167,20 @@ async function processJob(
   log(`   Channel: ${channel.name}`);
   log(`   Profile: ${channel.gologinProfileId || 'N/A'}`);
 
+  // Re-check channel status from server (user may have disabled while job was queued)
+  try {
+    const channels = await api.getChannels();
+    const freshChannel = channels.find((c: any) => c.id === channel.id);
+    if (freshChannel && !freshChannel.uploadEnabled) {
+      log(`⏹️ Channel "${channel.name}" đã bị TẮT trên web — bỏ qua job`);
+      await api.reportResult(job.id, 'FAILED', 'Channel disabled by user');
+      activeUploads.delete(channel.id);
+      return;
+    }
+  } catch {
+    // If check fails, continue with upload (fail-open)
+  }
+
   // Check upload schedule (uploadStartHour ~ uploadEndHour)
   const currentHour = new Date().getHours();
   const startHour = channel.uploadStartHour ?? 0;
@@ -199,7 +217,16 @@ async function processJob(
   }
 
   // ============================================================
-  // RE-SCAN Nextcloud trước khi upload → chọn video SỚM NHẤT
+  // UNIFIED SCAN → LOCK → DOWNLOAD LOOP
+  // 
+  // Race condition root cause: Between scanning Nextcloud (PROPFIND)
+  // and downloading a file, another channel can delete it → 404.
+  // No amount of locking can fix this because the lock and download
+  // are separate network calls.
+  //
+  // Solution: Merge lock + download into ONE retry loop.
+  // If download returns 404 → file was taken by another channel →
+  // permanently lock it and silently try the next file.
   // ============================================================
   let uploadTitle = job.title;
   let uploadDescription = job.description || '';
@@ -207,9 +234,10 @@ async function processJob(
   let remoteVideoPath = job.remoteVideoPath;
   let remoteThumbnailPath = job.remoteThumbnailPath;
   let remoteMetadataPath: string | null = null;
+  let videoPath = job.videoPath;
+  let downloadedFile: string | null = null;
 
-  // Re-scan Nextcloud to get freshest list and pick oldest video
-  if (channel.nextcloudFolder && settings.nextcloudUrl && settings.nextcloudUsername && settings.nextcloudPassword) {
+  if (!videoPath && channel.nextcloudFolder && settings.nextcloudUrl && settings.nextcloudUsername && settings.nextcloudPassword) {
     try {
       log(`🔄 Re-scan Nextcloud trước upload: ${channel.nextcloudFolder}`);
       const entries = await scanChannelFolder(
@@ -219,83 +247,100 @@ async function processJob(
         channel.nextcloudFolder
       );
 
-      if (entries.length > 0) {
-        // Try to lock one of the newest files (up to 15 files to support 10-20 parallel channels)
-        let selectedEntry = null;
-        let lockAcquiredEarly = false;
-        const tryCount = Math.min(entries.length, 15);
-        
-        log(`🔍 Đang tìm file chưa bị khoá trong top ${tryCount} file mới nhất...`);
-        for (let i = entries.length - 1; i >= entries.length - tryCount; i--) {
-          const entry = entries[i];
-          const locked = await api.lockFile(entry.videoPath, channel.id);
-          if (locked) {
-            selectedEntry = entry;
-            lockAcquiredEarly = true;
-            break;
-          } else {
-            // log(`🔒 Bỏ qua ${entry.videoPath.split('/').pop()} (đã bị lock)`);
-          }
-        }
-
-        if (!selectedEntry) {
-          log(`⚠️ Tất cả ${tryCount} file mới nhất đều đang bị xử lý bởi kênh khác.`);
-          await api.reportResult(job.id, 'FAILED', 'All newest files locked by other channels');
-          activeUploads.delete(channel.id);
-          return;
-        }
-
-        log(`📌 ĐÃ CHỐT VIDEO: "${selectedEntry.title}" (${selectedEntry.createdAt})`);
-        log(`   Tổng cộng ${entries.length} file trên Nextcloud`);
-
-        // Override job metadata with the selected unlocked file data
-        uploadTitle = selectedEntry.title;
-        uploadDescription = selectedEntry.description;
-        uploadVisibility = (selectedEntry.visibility as 'public' | 'unlisted' | 'private') || 'public';
-        remoteVideoPath = selectedEntry.videoPath;
-        remoteThumbnailPath = selectedEntry.thumbnailPath;
-        remoteMetadataPath = selectedEntry.metadataPath;
-      } else {
+      if (entries.length === 0) {
         log(`⚠️ Không còn video nào trên Nextcloud cho channel "${channel.name}"`);
         await api.reportResult(job.id, 'FAILED', 'No videos available on Nextcloud');
         activeUploads.delete(channel.id);
         return;
       }
+
+      const tryCount = Math.min(entries.length, 15);
+      log(`🔍 Scan-Lock-Download: thử ${tryCount} file mới nhất (${entries.length} tổng)...`);
+      let foundFile = false;
+
+      for (let i = entries.length - 1; i >= entries.length - tryCount; i--) {
+        const entry = entries[i];
+        const fileName = entry.videoPath.split('/').pop() || entry.videoPath;
+
+        // Step 1: Try to lock this file
+        const locked = await api.lockFile(entry.videoPath, channel.id);
+        if (!locked) {
+          continue; // Locked by another channel, try next
+        }
+
+        // Step 2: Try to download the locked file
+        try {
+          log(`☁️ Tải video: ${fileName}`);
+          downloadedFile = await downloadFromNextcloud(
+            settings.nextcloudUrl,
+            settings.nextcloudUsername,
+            settings.nextcloudPassword,
+            entry.videoPath
+          );
+
+          // SUCCESS: File downloaded! Set metadata and break out.
+          videoPath = downloadedFile;
+          uploadTitle = entry.title;
+          uploadDescription = entry.description;
+          uploadVisibility = (entry.visibility as 'public' | 'unlisted' | 'private') || 'public';
+          remoteVideoPath = entry.videoPath;
+          remoteThumbnailPath = entry.thumbnailPath;
+          remoteMetadataPath = entry.metadataPath;
+          foundFile = true;
+
+          log(`📌 ĐÃ TẢI THÀNH CÔNG: "${entry.title}"`);
+          break;
+
+        } catch (dlErr: any) {
+          if (dlErr.message && dlErr.message.includes('404')) {
+            // 404 = File was already taken and deleted by another channel.
+            // Mark as permanently locked so no one else tries either.
+            log(`⏭️ File đã bị xoá bởi kênh khác (404): ${fileName} — thử file tiếp...`);
+            await api.unlockFile(entry.videoPath, channel.id, true);
+            continue; // Try next file
+          }
+          // Non-404 error (network, server down, etc.) — real failure
+          log(`❌ Lỗi tải video: ${dlErr.message}`);
+          await api.unlockFile(entry.videoPath, channel.id, false);
+          await api.reportResult(job.id, 'FAILED', `Download failed: ${dlErr.message}`);
+          activeUploads.delete(channel.id);
+          return;
+        }
+      }
+
+      if (!foundFile) {
+        log(`⚠️ Tất cả ${tryCount} file đều đang bị xử lý hoặc đã xoá. Chờ lượt sau.`);
+        await api.reportResult(job.id, 'FAILED', 'All files locked or already processed by other channels');
+        activeUploads.delete(channel.id);
+        return;
+      }
+
     } catch (err: any) {
-      log(`⚠️ Re-scan error: ${err.message} — dùng job data gốc`);
+      log(`⚠️ Scan error: ${err.message} — thử dùng job data gốc`);
     }
   }
 
-  // Determine video path
-  let videoPath = job.videoPath;
-  let downloadedFile: string | null = null;
-
-  // If video is on Nextcloud, download first
+  // Fallback: If video is on Nextcloud but scan loop didn't run (no nextcloudFolder set)
   const effectiveRemoteVideo = remoteVideoPath || job.remoteVideoPath;
   if (!videoPath && effectiveRemoteVideo && settings.nextcloudUrl && settings.nextcloudUsername && settings.nextcloudPassword) {
-    // ── Server-side file lock ── prevent race condition between parallel channels
     const lockAcquired = await api.lockFile(effectiveRemoteVideo, channel.id);
     if (!lockAcquired) {
-      log(`🔒 File đã bị lock bởi kênh khác: ${effectiveRemoteVideo} — bỏ qua job này`);
-      await api.reportResult(job.id, 'FAILED', 'File locked by another channel — will retry');
+      log(`🔒 File đã bị lock bởi kênh khác — bỏ qua job này`);
+      await api.reportResult(job.id, 'FAILED', 'File locked by another channel');
       activeUploads.delete(channel.id);
       return;
     }
-    log(`🔓 Lock acquired: ${effectiveRemoteVideo.split('/').pop()}`);
-
     try {
-      log(`☁️ Tải video từ Nextcloud: ${effectiveRemoteVideo}`);
       downloadedFile = await downloadFromNextcloud(
-        settings.nextcloudUrl,
-        settings.nextcloudUsername,
-        settings.nextcloudPassword,
+        settings.nextcloudUrl, settings.nextcloudUsername, settings.nextcloudPassword,
         effectiveRemoteVideo
       );
       videoPath = downloadedFile;
     } catch (err: any) {
-      log(`❌ Lỗi tải video: ${err.message}`);
-      await api.unlockFile(effectiveRemoteVideo, channel.id);
-      await api.reportResult(job.id, 'FAILED', `Download failed: ${err.message}`);
+      await api.unlockFile(effectiveRemoteVideo, channel.id, err.message?.includes('404'));
+      if (!err.message?.includes('404')) {
+        await api.reportResult(job.id, 'FAILED', `Download failed: ${err.message}`);
+      }
       activeUploads.delete(channel.id);
       return;
     }
@@ -469,8 +514,7 @@ async function collectAllChannelStats(
  */
 async function scanForNewVideos(api: ApiClient) {
   try {
-    const response = await api.fetchJob();
-    const settings = response.settings;
+    const settings = await api.getSettings();
 
     if (!settings?.nextcloudUrl || !settings?.nextcloudUsername || !settings?.nextcloudPassword) return;
     if (!settings?.autoUploadEnabled) return;
@@ -516,6 +560,119 @@ async function scanForNewVideos(api: ApiClient) {
   }
 }
 
+function buildCleanupBundlePaths(candidate: {
+  remoteVideoPath: string | null;
+  remoteThumbnailPath: string | null;
+}) {
+  if (!candidate.remoteVideoPath) return null;
+  const videoPath = candidate.remoteVideoPath;
+  const videoBase = videoPath.replace(/\.[^.]+$/, '');
+  const baseName = videoBase.split('/').pop() || '';
+  const folderPrefix = videoBase.replace(/\/videos\/[^/]+$/, '');
+
+  return {
+    videoPath,
+    thumbnailPath: candidate.remoteThumbnailPath || `${folderPrefix}/thumbnails/${baseName}.png`,
+    metadataPath: `${folderPrefix}/metadata/${baseName}.json`,
+  };
+}
+
+async function runRetentionCleanup(
+  api: ApiClient,
+  activeChannelIds: number[]
+) {
+  const startMs = Date.now();
+  let candidateJobs = 0;
+  let attemptedFiles = 0;
+  let deletedFiles = 0;
+  let failedFiles = 0;
+  let deletedJobs = 0;
+  let rounds = 0;
+  const cleanedVideoPaths = new Set<string>();
+
+  const settings = await api.getSettings();
+  if (!settings?.nextcloudUrl || !settings.nextcloudUsername || !settings.nextcloudPassword) {
+    log(`[Cleanup] Skip - Nextcloud is not configured`);
+    return;
+  }
+
+  const cutoff = new Date(Date.now() - RETENTION_HOURS * 60 * 60 * 1000).toISOString();
+
+  for (;;) {
+    rounds += 1;
+    const { candidates } = await api.getCleanupCandidates(
+      cutoff,
+      CLEANUP_BATCH_SIZE,
+      activeChannelIds
+    );
+    if (candidates.length === 0) break;
+
+    candidateJobs += candidates.length;
+    const jobIds: number[] = [];
+
+    for (let i = 0; i < candidates.length; i += CLEANUP_FILE_CONCURRENCY) {
+      const chunk = candidates.slice(i, i + CLEANUP_FILE_CONCURRENCY);
+      const chunkResults = await Promise.all(
+        chunk.map(async (candidate) => {
+          if (candidate.remoteVideoPath && cleanedVideoPaths.has(candidate.remoteVideoPath)) {
+            return {
+              attemptedFiles: 0,
+              deletedFiles: 0,
+              failedFiles: 0,
+              jobId: candidate.id,
+            };
+          }
+
+          const bundle = buildCleanupBundlePaths(candidate);
+          if (!bundle) {
+            return {
+              attemptedFiles: 0,
+              deletedFiles: 0,
+              failedFiles: 0,
+              jobId: candidate.id,
+            };
+          }
+          const stats = await deleteVideoBundleWithStats(
+            settings.nextcloudUrl!,
+            settings.nextcloudUsername!,
+            settings.nextcloudPassword!,
+            bundle
+          );
+          if (candidate.remoteVideoPath) {
+            cleanedVideoPaths.add(candidate.remoteVideoPath);
+          }
+          return { ...stats, jobId: candidate.id };
+        })
+      );
+
+      for (const result of chunkResults) {
+        attemptedFiles += result.attemptedFiles;
+        deletedFiles += result.deletedFiles;
+        failedFiles += result.failedFiles;
+        jobIds.push(result.jobId);
+      }
+    }
+
+    if (jobIds.length > 0) {
+      deletedJobs += await api.deleteCleanupJobs(jobIds);
+    }
+  }
+
+  const elapsedMs = Date.now() - startMs;
+  log(
+    `[Cleanup] ${JSON.stringify({
+      retentionHours: RETENTION_HOURS,
+      rounds,
+      candidateJobs,
+      attemptedFiles,
+      deletedFiles,
+      failedFiles,
+      deletedJobs,
+      elapsedMs,
+    })}`
+  );
+}
+
 async function main() {
   const config = await setup();
   const api = new ApiClient(config.serverUrl, config.agentToken);
@@ -536,7 +693,7 @@ async function main() {
 
   // Verify token
   try {
-    await api.fetchJob();
+    await api.getSettings();
     log('✅ Agent Token hợp lệ');
   } catch (err: any) {
     log(`❌ ${err.message}`);
@@ -564,6 +721,18 @@ async function main() {
   log(`\n🤖 Agent đang chạy — poll mỗi ${POLL_INTERVAL / 1000}s`);
   log('   Nhấn Ctrl+C để dừng\n');
 
+  // Trigger a restart heartbeat to clear out any stuck UPLOADING jobs globally
+  // This helps the system self-heal from agent crashes or hard stops
+  try {
+    await api.sendHeartbeat({
+      version: AGENT_VERSION,
+      status: 'starting',
+      activeUploads: 0,
+      message: 'Khởi động agent... dọn dẹp job kẹt',
+      isRestart: true
+    });
+  } catch (err) {}
+
   // Graceful shutdown
   let running = true;
   process.on('SIGINT', async () => {
@@ -576,10 +745,26 @@ async function main() {
   let lastScan = 0;
   let lastStatsCollect = 0;
   let statsInterval = DEFAULT_STATS_INTERVAL;
+  let lastCleanup = 0;
+  let cleanupRunning = false;
 
   // Main polling loop
   while (running) {
     try {
+      // Periodic retention cleanup (non-blocking)
+      if (!cleanupRunning && Date.now() - lastCleanup > CLEANUP_INTERVAL) {
+        cleanupRunning = true;
+        const activeChannelIds = Array.from(activeUploads);
+        runRetentionCleanup(api, activeChannelIds)
+          .catch((err: any) => {
+            log(`[Cleanup] Error: ${err.message}`);
+          })
+          .finally(() => {
+            lastCleanup = Date.now();
+            cleanupRunning = false;
+          });
+      }
+
       // Send heartbeat
       const currentStatus = activeUploads.size > 0 ? 'uploading' : 'idle';
       const statusMsg = activeUploads.size > 0
@@ -608,12 +793,12 @@ async function main() {
 
       // Periodic YouTube analytics stats collection (only when idle) - TEMPORARILY DISABLED
       if (false && activeUploads.size === 0 && Date.now() - lastStatsCollect > statsInterval) {
-        const response = await api.fetchJob();
-        const gologinToken = response.settings?.gologinToken || null;
+        const settings = await api.getSettings();
+        const gologinToken = settings?.gologinToken || null;
         // Update statsInterval from server settings if available
         const statsSettings = await api.getStatsSettings();
-        if (statsSettings) {
-          statsInterval = (statsSettings.statsCollectInterval || 120) * 60 * 1000;
+        if (statsSettings?.statsCollectInterval) {
+          statsInterval = statsSettings.statsCollectInterval * 60 * 1000;
         }
         await api.sendHeartbeat({
           version: AGENT_VERSION,
@@ -654,37 +839,47 @@ async function main() {
           continue;
         }
 
-        // Check per-channel interval
+        // Informational per-channel interval check.
+        // Dispatch gating is handled by server-side scheduler (pick-ahead window).
         const lastUploadTime = channelLastUpload.get(channelId) || 0;
         const intervalMs = (job.channel.uploadInterval || 30) * 60 * 1000;
         const elapsed = Date.now() - lastUploadTime;
+        const remainingMs = intervalMs - elapsed;
 
-        if (elapsed >= intervalMs) {
-          // ★ Add to activeUploads BEFORE starting async processJob
-          activeUploads.add(channelId);
-
-          // Wrap processJob with 10-minute timeout to prevent infinite hangs
-          const UPLOAD_TIMEOUT = 10 * 60 * 1000; // 10 minutes
-          const timeoutPromise = new Promise<void>((_, reject) =>
-            setTimeout(() => reject(new Error('Upload timeout (10 min)')), UPLOAD_TIMEOUT)
-          );
-
-          Promise.race([
-            processJob(api, job, settings || null),
-            timeoutPromise,
-          ]).catch(async (err) => {
-            log(`❌ Job #${job.id} error: ${err.message}`);
-            try { await api.reportResult(job.id, 'FAILED', err.message); } catch {}
-            activeUploads.delete(channelId);
-          });
-
-          // Small delay before checking for more jobs
-          await new Promise((r) => setTimeout(r, 3000));
-          continue; // Immediately poll for next job
-        } else {
-          const remaining = Math.ceil((intervalMs - elapsed) / 60000);
-          log(`⏳ Channel "${job.channel.name}": chờ ${remaining}ph trước upload tiếp`);
+        if (remainingMs > 0 && lastUploadTime > 0) {
+          const remaining = Math.ceil(remainingMs / 60000);
+          log(`⏳ Prefetch: "${job.channel.name}" còn ~${remaining}ph tới cooldown mốc, bắt đầu chuẩn bị upload`);
         }
+
+        // ★ Add to activeUploads BEFORE starting async processJob
+        activeUploads.add(channelId);
+
+        // Wrap processJob with 25-minute timeout to prevent infinite hangs
+        // Phase 1 (upload): up to 8 min + Phase 2 (checks): up to 8 min + overhead = ~20 min max
+        const UPLOAD_TIMEOUT = 25 * 60 * 1000; // 25 minutes
+        const timeoutPromise = new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new Error('Upload timeout (25 min)')), UPLOAD_TIMEOUT)
+        );
+
+        Promise.race([
+          processJob(api, job, settings || null),
+          timeoutPromise,
+        ]).catch(async (err) => {
+          log(`❌ Job #${job.id} error: ${err.message}`);
+          try { await api.reportResult(job.id, 'FAILED', err.message); } catch {}
+          activeUploads.delete(channelId);
+        });
+
+        // ★ Stagger delay: wait 3 minutes between starting concurrent jobs
+        // This creates a pipeline effect:
+        //   t=0   Job#1: download + navigate (no YouTube bandwidth)
+        //   t=3m  Job#2: download + navigate | Job#1: uploading to YouTube
+        //   t=6m  Job#3: download | Job#2: uploading | Job#1: nearly done
+        // → At most ~2 concurrent YouTube uploads at any time
+        const STAGGER_DELAY = 3 * 60 * 1000; // 3 minutes
+        log(`🔄 Job dispatched: ${job.channel.name} — stagger ${STAGGER_DELAY / 1000}s trước job tiếp`);
+        await new Promise((r) => setTimeout(r, STAGGER_DELAY));
+        continue; // Poll for next job
       }
 
       // Wait before next poll

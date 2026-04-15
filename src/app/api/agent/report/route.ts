@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
-import { sendAlert } from "@/lib/telegram";
+import { sendAlert, sendUploadSuccess } from "@/lib/telegram";
 
 // POST /api/agent/report — Agent reports job result
 // Auth: Bearer <agentToken>
@@ -20,6 +20,9 @@ export async function POST(request: Request) {
   }
 
   const { jobId, status, error, youtubeUrl, youtubeId } = await request.json();
+  const normalizedError = typeof error === "string" ? error.trim() : "";
+  const persistedError =
+    status === "FAILED" ? normalizedError || "Loi khong xac dinh" : null;
 
   if (!jobId || !status) {
     return NextResponse.json(
@@ -52,12 +55,18 @@ export async function POST(request: Request) {
     where: { id: jobId },
     data: {
       status,
-      error: error || null,
+      error: persistedError,
       youtubeUrl: youtubeUrl || undefined,
       youtubeId: youtubeId || undefined,
       uploadedAt: status === "DONE" ? new Date() : undefined,
     },
   });
+
+  const channel = await prisma.channel.findUnique({
+    where: { id: upload.channelId },
+    select: { id: true, name: true },
+  });
+  const channelName = channel?.name || `Channel #${upload.channelId}`;
 
   // Update channel lastUpload if successful
   if (status === "DONE") {
@@ -65,19 +74,60 @@ export async function POST(request: Request) {
       where: { id: upload.channelId },
       data: { lastUpload: new Date() },
     });
+
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const totalUploadedToday = await prisma.upload.count({
+      where: {
+        channelId: upload.channelId,
+        status: "DONE",
+        uploadedAt: { gte: todayStart },
+      },
+    });
+
+    const finalYoutubeUrl =
+      updated.youtubeUrl ||
+      (updated.youtubeId ? `https://youtu.be/${updated.youtubeId}` : "N/A");
+
+    sendUploadSuccess(user.id, {
+      channelName,
+      youtubeUrl: finalYoutubeUrl,
+      totalUploadedToday,
+      uploadedAt: updated.uploadedAt || new Date(),
+    }).catch(() => {});
   }
 
   // Send Telegram alert on upload failure (fire-and-forget)
+  // Skip alerts for expected/intentional failures.
   if (status === "FAILED") {
-    const channel = await prisma.channel.findUnique({
-      where: { id: upload.channelId },
-    });
-    const chName = channel?.name || `Channel #${upload.channelId}`;
-    const errMsg = error ? error.substring(0, 200) : "Loi khong xac dinh";
-    sendAlert(
-      user.id,
-      `Upload that bai!\n\nKenh: <b>${chName}</b>\nVideo: ${upload.title}\nLoi: ${errMsg}`
-    ).catch(() => {});
+    const errorLower = persistedError.toLowerCase();
+    const isExpectedContention =
+      errorLower.includes("404") ||
+      errorLower.includes("locked") ||
+      errorLower.includes("all files locked") ||
+      errorLower.includes("all newest files");
+    const isChannelDisabled = errorLower.includes("channel disabled by user");
+
+    console.error(
+      "[AgentReport]",
+      JSON.stringify({
+        event: "upload_failed",
+        jobId,
+        channelId: upload.channelId,
+        channelName,
+        status,
+        error: persistedError,
+        updatedAt: updated.updatedAt.toISOString(),
+      })
+    );
+
+    if (!isExpectedContention && !isChannelDisabled) {
+      const errMsg = persistedError.substring(0, 200);
+      sendAlert(
+        user.id,
+        `Upload that bai!\n\nKenh: <b>${channelName}</b>\nVideo: ${upload.title}\nLoi: ${errMsg}`
+      ).catch(() => {});
+    }
   }
 
   return NextResponse.json({ success: true, upload: updated });

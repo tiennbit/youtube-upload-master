@@ -110,7 +110,7 @@ describe("API Routes — Agent", () => {
       expect(updated!.status).toBe("UPLOADING");
     });
 
-    it("should return oldest PENDING job first (FIFO)", async () => {
+    it("should return newest PENDING job first for same channel", async () => {
       const { agentToken, channel } = await createAgentTestUser();
 
       await prisma.upload.create({
@@ -126,7 +126,7 @@ describe("API Routes — Agent", () => {
       });
 
       const data = await res.json();
-      expect(data.job.title).toBe("FIFO-First");
+      expect(data.job.title).toBe("FIFO-Second");
     });
 
     it("should skip DONE and FAILED uploads", async () => {
@@ -145,6 +145,109 @@ describe("API Routes — Agent", () => {
 
       const data = await res.json();
       expect(data.job).toBeFalsy();
+    });
+
+    it("should not dispatch another job for a channel already UPLOADING", async () => {
+      const { agentToken, channel } = await createAgentTestUser();
+
+      const channel2 = await prisma.channel.create({
+        data: {
+          userId: channel.userId,
+          name: `Agent-Ch2-${Date.now()}-${counter}`,
+          gologinProfileId: "gologin-profile-def",
+          uploadStartHour: 0,
+          uploadEndHour: 23,
+          uploadInterval: 30,
+          lastUpload: new Date(Date.now() - 60 * 60 * 1000),
+        },
+      });
+
+      await prisma.channel.update({
+        where: { id: channel.id },
+        data: {
+          lastUpload: new Date(Date.now() - 2 * 60 * 60 * 1000),
+        },
+      });
+
+      await prisma.upload.create({
+        data: {
+          channelId: channel.id,
+          title: "Already uploading on channel 1",
+          status: "UPLOADING",
+        },
+      });
+
+      await prisma.upload.create({
+        data: {
+          channelId: channel.id,
+          title: "Pending on busy channel",
+          status: "PENDING",
+        },
+      });
+
+      await prisma.upload.create({
+        data: {
+          channelId: channel2.id,
+          title: "Pending on free channel",
+          status: "PENDING",
+        },
+      });
+
+      const res = await fetch(`${BASE_URL}/api/agent/jobs`, {
+        headers: { Authorization: `Bearer ${agentToken}` },
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.job).not.toBeNull();
+      expect(data.job.channel.id).toBe(channel2.id);
+      expect(data.job.title).toBe("Pending on free channel");
+    });
+
+    it("should not dispatch when global uploading reaches maxConcurrent", async () => {
+      const { agentToken, channel } = await createAgentTestUser();
+
+      await prisma.userSettings.update({
+        where: { userId: channel.userId },
+        data: { maxConcurrent: 1 },
+      });
+
+      const channel2 = await prisma.channel.create({
+        data: {
+          userId: channel.userId,
+          name: `Agent-Ch3-${Date.now()}-${counter}`,
+          gologinProfileId: "gologin-profile-ghi",
+          uploadStartHour: 0,
+          uploadEndHour: 23,
+          uploadInterval: 30,
+          lastUpload: new Date(Date.now() - 90 * 60 * 1000),
+        },
+      });
+
+      await prisma.upload.create({
+        data: {
+          channelId: channel.id,
+          title: "Existing uploading job",
+          status: "UPLOADING",
+        },
+      });
+
+      await prisma.upload.create({
+        data: {
+          channelId: channel2.id,
+          title: "Pending while at capacity",
+          status: "PENDING",
+        },
+      });
+
+      const res = await fetch(`${BASE_URL}/api/agent/jobs`, {
+        headers: { Authorization: `Bearer ${agentToken}` },
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.job).toBeNull();
+      expect(data.reason).toBe("max_concurrent_reached");
     });
   });
 
