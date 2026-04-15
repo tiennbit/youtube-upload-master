@@ -100,7 +100,7 @@ export async function POST(request: Request) {
   // Send Telegram alert on upload failure (fire-and-forget)
   // Skip alerts for expected/intentional failures.
   if (status === "FAILED") {
-    const errorLower = persistedError.toLowerCase();
+    const errorLower = (persistedError ?? "").toLowerCase();
     const isExpectedContention =
       errorLower.includes("404") ||
       errorLower.includes("locked") ||
@@ -122,7 +122,7 @@ export async function POST(request: Request) {
     );
 
     if (!isExpectedContention && !isChannelDisabled) {
-      const errMsg = persistedError.substring(0, 200);
+      const errMsg = (persistedError ?? "").substring(0, 200);
       sendAlert(
         user.id,
         `Upload that bai!\n\nKenh: <b>${channelName}</b>\nVideo: ${upload.title}\nLoi: ${errMsg}`
