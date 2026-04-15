@@ -244,7 +244,8 @@ async function processJob(
         settings.nextcloudUrl,
         settings.nextcloudUsername,
         settings.nextcloudPassword,
-        channel.nextcloudFolder
+        channel.nextcloudFolder,
+        30 // Only download 30 newest metadata (need 15 candidates + margin)
       );
 
       if (entries.length === 0) {
@@ -531,7 +532,8 @@ async function scanForNewVideos(api: ApiClient) {
           settings.nextcloudUrl,
           settings.nextcloudUsername,
           settings.nextcloudPassword,
-          channel.nextcloudFolder
+          channel.nextcloudFolder,
+          20 // Only download 20 newest metadata (only need 1 for job creation)
         );
 
         if (entries.length > 0) {

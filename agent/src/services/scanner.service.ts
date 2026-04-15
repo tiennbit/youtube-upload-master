@@ -138,7 +138,8 @@ export async function scanChannelFolder(
   nextcloudUrl: string,
   username: string,
   password: string,
-  channelFolder: string
+  channelFolder: string,
+  maxEntries?: number
 ): Promise<VideoEntry[]> {
   const baseUrl = nextcloudUrl.replace(/\/$/, '');
   const cleanFolder = channelFolder.trim().replace(/^\//, '').replace(/\/$/, '');
@@ -156,10 +157,20 @@ export async function scanChannelFolder(
     return scanNextcloudFolder(nextcloudUrl, username, password, channelFolder);
   }
 
-  const jsonFiles = metaFiles.filter(f => f.name.endsWith('.json'));
+  let jsonFiles = metaFiles.filter(f => f.name.endsWith('.json'));
   console.log(`[Scanner] Tìm thấy ${jsonFiles.length} metadata files`);
 
   if (jsonFiles.length === 0) return [];
+
+  // Optimization: only download the N newest metadata JSONs
+  // File names contain timestamps (e.g. news_16631_1776272652470.json)
+  // so sorting by name gives approximate chronological order
+  if (maxEntries && maxEntries > 0 && jsonFiles.length > maxEntries) {
+    jsonFiles.sort((a, b) => a.name.localeCompare(b.name));
+    const skipped = jsonFiles.length - maxEntries;
+    jsonFiles = jsonFiles.slice(-maxEntries);
+    console.log(`[Scanner] ⚡ Chỉ tải ${maxEntries} metadata mới nhất (bỏ qua ${skipped})`);
+  }
 
   // Step 2: List video and thumbnail files for matching
   let videoFiles: RemoteFile[] = [];
