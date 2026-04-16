@@ -72,11 +72,16 @@ export class ApiClient {
     return { Authorization: `Bearer ${this.agentToken}` };
   }
 
-  async fetchJob(skipChannelIds?: number[]): Promise<JobResponse> {
-    let url = `${this.serverUrl}/api/agent/jobs`;
+  async fetchJob(skipChannelIds?: number[], localHour?: number): Promise<JobResponse> {
+    const params = new URLSearchParams();
     if (skipChannelIds && skipChannelIds.length > 0) {
-      url += `?skipChannels=${skipChannelIds.join(',')}`;
+      params.set('skipChannels', skipChannelIds.join(','));
     }
+    if (localHour !== undefined) {
+      params.set('localHour', String(localHour));
+    }
+    const query = params.toString();
+    const url = `${this.serverUrl}/api/agent/jobs${query ? `?${query}` : ''}`;
     const res = await fetch(url, {
       headers: this.headers,
     });

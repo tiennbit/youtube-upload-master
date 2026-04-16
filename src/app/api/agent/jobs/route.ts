@@ -76,7 +76,10 @@ export async function GET(request: Request) {
   }
 
   const now = new Date();
-  const currentHour = now.getHours();
+  // Use agent's local hour for schedule checking (agent knows correct timezone)
+  // Falls back to server time if not provided (backward compatibility)
+  const localHourParam = url.searchParams.get("localHour");
+  const currentHour = localHourParam !== null ? parseInt(localHourParam) : now.getHours();
   const settings = user.settings;
   const maxConcurrent = Math.max(1, settings?.maxConcurrent ?? 3);
 

@@ -196,6 +196,7 @@ async function processJob(
     }
     if (!inSchedule) {
       log(`⏰ Channel "${channel.name}": ngoài giờ hẹn (${startHour}h - ${endHour}h), hiện tại ${currentHour}h — bỏ qua`);
+      await api.reportResult(job.id, 'FAILED', `Outside schedule (${startHour}h-${endHour}h, current: ${currentHour}h)`);
       activeUploads.delete(channel.id);
       return;
     }
@@ -826,7 +827,7 @@ async function main() {
         }
       }
 
-      const response = await api.fetchJob(skipChannelIds.length > 0 ? skipChannelIds : undefined);
+      const response = await api.fetchJob(skipChannelIds.length > 0 ? skipChannelIds : undefined, new Date().getHours());
       const settings = response.settings;
       const maxConcurrent = settings?.maxConcurrent ?? 3;
 
