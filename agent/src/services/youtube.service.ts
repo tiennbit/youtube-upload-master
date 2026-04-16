@@ -131,6 +131,8 @@ export async function uploadVideo(
 
   let uploadSucceeded = false;
   let page!: Page;
+  let currentStep = 'init';
+  const uploadStartTime = Date.now();
 
   try {
     // Start GoLogin profile (non-headless for file uploads)
@@ -293,6 +295,7 @@ export async function uploadVideo(
     } catch {}
 
     // Step 1: Click Create button (with retry)
+    currentStep = 'S1-CreateBtn';
     console.log('[Upload] Step 1: Click Create button');
     let createButtonFound = false;
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -322,6 +325,7 @@ export async function uploadVideo(
     await delay(2000);
 
     // Step 3: Upload video file via CDP (bypasses Puppeteer evaluate which crashes Orbita)
+    currentStep = 'S3-FileUpload';
     console.log(`[Upload] Step 3: Upload file via CDP`);
     const absolutePath = path.resolve(videoPath);
     console.log(`[Upload] File path: ${absolutePath}`);
@@ -429,6 +433,7 @@ export async function uploadVideo(
     }
 
     // Step 8: Not for kids
+    currentStep = 'S8-NotForKids';
     console.log('[Upload] Step 8: Mark not for kids');
     try { await waitAndClick(page, SELECTORS.NOT_FOR_KIDS_RADIO, 10000); } catch {}
     await delay(1000);
@@ -587,6 +592,7 @@ export async function uploadVideo(
     // Navigate through remaining tabs until Visibility
     // Just click Next repeatedly — no need to wait for "Checks" since the tab label
     // "Checks"/"Kiểm tra" appears on ALL pages and causes false detection
+    currentStep = 'S9-NavVisibility';
     console.log('[Upload] Step 9.6: Navigate to Visibility tab');
     let reachedVisibility = await isOnVisibilityTab();
     let navAttempts = 0;
@@ -650,6 +656,7 @@ export async function uploadVideo(
     }
 
     // Step 10: Set Visibility
+    currentStep = 'S10-Visibility';
     console.log(`[Upload] Step 10: Set visibility: ${visibility}`);
     await delay(5000);
 
@@ -739,6 +746,7 @@ export async function uploadVideo(
     //
     // New logic: single loop, check every 15s, max 20 min (80 iterations × 15s)
     // When Done button is enabled → click immediately
+    currentStep = 'S11-WaitDone';
     console.log('[Upload] Step 11: Waiting for upload + checks + Done button (max 20 min)...');
     let sessionAlive = true;
     let saveClicked = false;
@@ -901,6 +909,7 @@ export async function uploadVideo(
 
     // Step 12: Handle confirmation popup (Public → YouTube shows confirm dialog)
     // THIS IS CRITICAL — without clicking the confirm button, video stays as Draft!
+    currentStep = 'S12-ConfirmPublish';
     console.log('[Upload] Step 12: Handle confirmation popup...');
     try {
       // Take screenshot BEFORE trying to click confirm (for debugging)
@@ -1178,8 +1187,30 @@ export async function uploadVideo(
 
     return { success: true, message: `Upload thành công: ${title}`, videoUrl, videoId, detectedStudioUrl };
   } catch (err: any) {
-    console.error(`[Upload] ❌ Lỗi: ${err.message}`);
-    return { success: false, message: err.message };
+    const elapsed = Math.round((Date.now() - uploadStartTime) / 1000);
+    const elapsedStr = elapsed >= 60 ? `${Math.floor(elapsed / 60)}m${elapsed % 60}s` : `${elapsed}s`;
+
+    // Capture page state for diagnostics
+    let pageUrl = 'N/A';
+    let pageState = '';
+    try {
+      pageUrl = page?.url?.() || 'N/A';
+      pageState = await page?.evaluate?.(() => {
+        const body = (document.body?.innerText || '').substring(0, 300);
+        const btns = Array.from(document.querySelectorAll('ytcp-button, button'))
+          .filter(b => (b as HTMLElement).offsetParent !== null)
+          .map(b => (b.textContent || '').trim().substring(0, 20))
+          .filter(t => t.length > 0)
+          .slice(0, 8);
+        return `buttons=[${btns.join(', ')}]`;
+      }) || '';
+    } catch {}
+
+    const diagMsg = `[Step: ${currentStep}] [${elapsedStr}] ${err.message}`;
+    const diagDetail = pageState ? `\n📋 ${pageState}` : '';
+    console.error(`[Upload] ❌ ${diagMsg}${diagDetail}`);
+    console.error(`[Upload] 📍 URL: ${pageUrl}`);
+    return { success: false, message: `${diagMsg}${diagDetail}` };
   } finally {
     try { await page?.close(); } catch {}
     if (uploadSucceeded) {

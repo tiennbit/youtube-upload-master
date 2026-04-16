@@ -122,10 +122,12 @@ export async function POST(request: Request) {
     );
 
     if (!isExpectedContention && !isChannelDisabled) {
-      const errMsg = (persistedError ?? "").substring(0, 200);
+      const errMsg = (persistedError ?? "").substring(0, 300);
+      const timeStr = new Date().toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Ho_Chi_Minh" });
+      const dateStr = new Date().toLocaleDateString("vi-VN", { day: "2-digit", month: "2-digit", year: "numeric", timeZone: "Asia/Ho_Chi_Minh" });
       sendAlert(
         user.id,
-        `Upload that bai!\n\nKenh: <b>${channelName}</b>\nVideo: ${upload.title}\nLoi: ${errMsg}`
+        `Upload that bai!\n\nKenh: <b>${channelName}</b>\nVideo: ${upload.title}\nJob: #${jobId}\nLoi: ${errMsg}\n\n${timeStr} ${dateStr}`
       ).catch(() => {});
     }
   }
