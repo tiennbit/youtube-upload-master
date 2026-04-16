@@ -136,7 +136,9 @@ export async function uploadVideo(
 
   try {
     // Start GoLogin profile (non-headless for file uploads)
+    currentStep = 'init-gologin';
     const { browser } = await startProfile(gologinProfileId, gologinToken);
+    currentStep = 'init-newpage';
     page = await browser.newPage();
 
     // Close old tabs (keep new one)
@@ -154,6 +156,7 @@ export async function uploadVideo(
     const expectedChannelId = expectedMatch?.[1];
 
     if (expectedChannelId) {
+      currentStep = 'init-warmup';
       console.log(`[Upload] Pre-warming channel session: ${expectedChannelId}`);
       try {
         // Step 1: Visit the channel's YouTube page (sets active channel cookie)
@@ -168,6 +171,7 @@ export async function uploadVideo(
     }
 
     // Navigate to YouTube Studio (with channel ID in URL)
+    currentStep = 'init-navigate';
     const target = studioUrl || 'https://studio.youtube.com';
     console.log(`[Upload] Navigating to: ${target}`);
     await page.goto(target, { waitUntil: 'networkidle2', timeout: 60000 });
@@ -1050,15 +1054,27 @@ export async function uploadVideo(
         }
 
         if (!publishClicked) {
-          const stillCheckingModal = await page.evaluate(() => {
+          // Check if the upload dialog has already closed (= publish succeeded)
+          const dialogState = await safeEvaluate(() => {
+            const dialog = document.querySelector('ytcp-uploads-dialog');
+            const dialogOpen = dialog && (dialog as HTMLElement).offsetParent !== null;
             const body = (document.body?.innerText || '').toLowerCase();
-            return (
+            const hasSuccessIndicators =
+              body.includes('go to video analytic') ||
+              body.includes('see comments') ||
+              body.includes('video published') ||
+              body.includes('video link');
+            const hasCheckingText =
               body.includes("we're still checking your video") ||
-              body.includes('still checking your video') ||
-              body.includes('wait for our checks to finish')
-            );
-          });
-          if (stillCheckingModal) {
+              body.includes('still checking your video');
+            return { dialogOpen, hasSuccessIndicators, hasCheckingText };
+          }, { dialogOpen: true, hasSuccessIndicators: false, hasCheckingText: false });
+
+          if (!dialogState.dialogOpen || dialogState.hasSuccessIndicators) {
+            // Dialog closed or success elements visible — publish actually succeeded!
+            publishClicked = true;
+            console.log('[Upload] ✅ Upload dialog closed — publish succeeded (was looking for modal unnecessarily)');
+          } else if (dialogState.hasCheckingText) {
             throw new Error('Chưa bấm được nút Publish trên popup "still checking your video"');
           }
         }
