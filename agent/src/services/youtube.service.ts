@@ -863,9 +863,9 @@ export async function uploadVideo(
 
         // Click Done ONLY if:
         // 1. Minimum 30s elapsed (avoid transient early-enabled state)
-        // 2. Button enabled for 2 consecutive checks (30s stable)
+        // 2. Button enabled at least once (Step 12 handles "still checking" modal)
         const elapsedMs = Date.now() - loopStartTime;
-        if (consecutiveReady >= 2 && elapsedMs >= MIN_WAIT_SECONDS * 1000) {
+        if (consecutiveReady >= 1 && elapsedMs >= MIN_WAIT_SECONDS * 1000) {
           const clicked = await tryClickDone();
           if (clicked) {
             saveClicked = true;

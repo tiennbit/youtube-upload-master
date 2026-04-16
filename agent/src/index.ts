@@ -857,11 +857,11 @@ async function main() {
         // ★ Add to activeUploads BEFORE starting async processJob
         activeUploads.add(channelId);
 
-        // Wrap processJob with 25-minute timeout to prevent infinite hangs
-        // Phase 1 (upload): up to 8 min + Phase 2 (checks): up to 8 min + overhead = ~20 min max
-        const UPLOAD_TIMEOUT = 25 * 60 * 1000; // 25 minutes
+        // Wrap processJob with 40-minute timeout to prevent infinite hangs
+        // Inner Done button loop = 20 min max, plus download/navigate overhead = ~30 min
+        const UPLOAD_TIMEOUT = 40 * 60 * 1000; // 40 minutes
         const timeoutPromise = new Promise<void>((_, reject) =>
-          setTimeout(() => reject(new Error('Upload timeout (25 min)')), UPLOAD_TIMEOUT)
+          setTimeout(() => reject(new Error('Upload timeout (40 min)')), UPLOAD_TIMEOUT)
         );
 
         Promise.race([
