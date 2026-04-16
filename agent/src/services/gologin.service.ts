@@ -210,10 +210,19 @@ export async function startProfile(
       break;
     } catch (err: any) {
       lastError = err;
+      const isDataError = err.message?.includes('"data" argument');
       console.error(`[GoLogin] Lần thử ${attempt}/5 thất bại: ${err.message}`);
+      if (isDataError) {
+        console.error(`[GoLogin] ↳ GoLogin SDK internal error (S3 profile data undefined)`);
+        // Clean temp files before retry — force fresh download
+        for (const t of [tempDir, tempZip, tempUploadZip]) {
+          try { if (fs.existsSync(t)) fs.rmSync(t, { recursive: true, force: true }); } catch {}
+        }
+      }
       if (attempt < 5) {
-        console.log(`[GoLogin] Thử lại sau 5s...`);
-        await new Promise((r) => setTimeout(r, 5000));
+        const retryDelay = 5000 * attempt; // 5s, 10s, 15s, 20s
+        console.log(`[GoLogin] Thử lại sau ${retryDelay / 1000}s...`);
+        await new Promise((r) => setTimeout(r, retryDelay));
       }
     }
   }
