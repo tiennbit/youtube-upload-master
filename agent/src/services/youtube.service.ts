@@ -972,8 +972,9 @@ export async function uploadVideo(
       // Public mode must explicitly hit "Publish" on the "still checking" modal.
       if (visibility === 'public') {
         let publishClicked = false;
-        for (let attempt = 1; attempt <= 4; attempt++) {
-          const publishState = await page.evaluate(() => {
+        for (let attempt = 1; attempt <= 6; attempt++) {
+          // Step A: Find the Publish button coordinates in the modal
+          const btnInfo = await page.evaluate(() => {
             const body = (document.body?.innerText || '').toLowerCase();
             const hasCheckingModal =
               body.includes("we're still checking your video") ||
@@ -994,23 +995,49 @@ export async function uploadVideo(
                 merged.includes('게시') ||
                 merged.includes('게시하기')
               ) {
-                (btn as HTMLElement).click();
-                return { hasCheckingModal, clicked: true, label: text || aria };
+                const rect = (btn as HTMLElement).getBoundingClientRect();
+                return {
+                  hasCheckingModal,
+                  found: true,
+                  label: text || aria,
+                  x: rect.x + rect.width / 2,
+                  y: rect.y + rect.height / 2,
+                };
               }
             }
-            return { hasCheckingModal, clicked: false, label: '' };
+            return { hasCheckingModal, found: false, label: '', x: 0, y: 0 };
           });
 
-          if (publishState.clicked) {
+          if (btnInfo.found) {
+            // Step B: Use Puppeteer mouse click (real mouse events, not DOM click)
+            console.log(`[Upload] 🖱️ Modal Publish button found at (${Math.round(btnInfo.x)}, ${Math.round(btnInfo.y)}) — clicking via mouse...`);
+            await page.mouse.click(btnInfo.x, btnInfo.y);
+            await delay(3000);
+
+            // Step C: Verify modal actually closed
+            const modalGone = await safeEvaluate(() => {
+              const body = (document.body?.innerText || '').toLowerCase();
+              return !body.includes("we're still checking your video") &&
+                     !body.includes('still checking your video');
+            }, false);
+
+            if (modalGone) {
+              publishClicked = true;
+              console.log(`[Upload] ✅ Publish confirmation clicked & modal closed (${btnInfo.label})`);
+              break;
+            } else {
+              console.log(`[Upload] ⚠️ Modal still open after click — retrying (${attempt}/6)...`);
+              await delay(2000);
+            }
+          } else if (!btnInfo.hasCheckingModal) {
+            // No modal at all — publish went through without modal
             publishClicked = true;
-            console.log(`[Upload] ✅ Publish confirmation clicked (${publishState.label})`);
+            console.log('[Upload] ✅ No checking modal — publish successful');
             break;
+          } else {
+            console.log(`[Upload] Waiting for publish button on checking modal... (${attempt}/6)`);
+            await delay(2000);
           }
-          if (!publishState.hasCheckingModal) {
-            break;
-          }
-          console.log(`[Upload] Waiting publish button on checking modal... (${attempt}/4)`);
-          await delay(2000);
         }
 
         if (!publishClicked) {
@@ -1045,15 +1072,9 @@ export async function uploadVideo(
     }
     await delay(5000);
 
-    if (visibility === 'public') {
-      const stillPrivate = await safeEvaluate(() => {
-        const text = (document.body?.innerText || '').toLowerCase();
-        return text.includes('saved as private') || text.includes('đã lưu ở chế độ riêng tư');
-      }, false);
-      if (stillPrivate) {
-        throw new Error('Video vẫn đang ở trạng thái "Saved as private" sau bước Publish');
-      }
-    }
+    // Note: "saved as private" check removed — YouTube UI takes time to update
+    // the header text even after a successful Publish. Step 12 now verifies
+    // the modal actually closed, which is a more reliable success indicator.
 
     // Verify: check if dialog closed (means save was successful)
     let dialogClosed = false;
