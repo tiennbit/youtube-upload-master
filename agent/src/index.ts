@@ -437,10 +437,40 @@ async function processJob(
     } else {
       log(`❌ Upload thất bại: ${result.message}`);
       await api.reportResult(job.id, 'FAILED', result.message);
+
+      // Set cooldown for persistent errors (session/Oops/proxy)
+      const msgLower = (result.message || '').toLowerCase();
+      if (
+        msgLower.includes('oops') ||
+        msgLower.includes('session expired') ||
+        msgLower.includes('re-login') ||
+        msgLower.includes('"data" argument')
+      ) {
+        channelCooldown.set(channel.id, {
+          until: Date.now() + COOLDOWN_DURATION,
+          reason: result.message.substring(0, 80),
+        });
+        log(`🧊 Channel "${channel.name}" cooldown 60 phút: ${result.message.substring(0, 60)}`);
+      }
     }
   } catch (err: any) {
     log(`❌ Lỗi không mong đợi: ${err.message}`);
     await api.reportResult(job.id, 'FAILED', err.message);
+
+    // Set cooldown for persistent errors
+    const msgLower = (err.message || '').toLowerCase();
+    if (
+      msgLower.includes('oops') ||
+      msgLower.includes('session expired') ||
+      msgLower.includes('re-login') ||
+      msgLower.includes('"data" argument')
+    ) {
+      channelCooldown.set(channel.id, {
+        until: Date.now() + COOLDOWN_DURATION,
+        reason: err.message.substring(0, 80),
+      });
+      log(`🧊 Channel "${channel.name}" cooldown 60 phút: ${err.message.substring(0, 60)}`);
+    }
   } finally {
     // Cleanup downloaded files
     if (downloadedFile) cleanupDownload(downloadedFile);
