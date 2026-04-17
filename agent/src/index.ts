@@ -75,6 +75,11 @@ async function setup(): Promise<{ serverUrl: string; agentToken: string }> {
 const channelLastUpload = new Map<number, number>();
 const activeUploads = new Set<number>(); // channelIds currently uploading
 
+// Cooldown channels that hit persistent errors (Oops, session expired, GoLogin crash)
+// Map<channelId, { until: timestamp, reason: string }>
+const channelCooldown = new Map<number, { until: number; reason: string }>();
+const COOLDOWN_DURATION = 60 * 60 * 1000; // 1 hour
+
 async function processJob(
   api: ApiClient,
   job: JobData,
@@ -826,6 +831,14 @@ async function main() {
           skipChannelIds.push(chId);
         }
       }
+      // Also skip channels on cooldown (Oops, session expired, GoLogin crash)
+      for (const [chId, cd] of channelCooldown.entries()) {
+        if (Date.now() < cd.until) {
+          if (!skipChannelIds.includes(chId)) skipChannelIds.push(chId);
+        } else {
+          channelCooldown.delete(chId); // Cooldown expired
+        }
+      }
 
       const response = await api.fetchJob(skipChannelIds.length > 0 ? skipChannelIds : undefined, new Date().getHours());
       const settings = response.settings;
@@ -871,6 +884,22 @@ async function main() {
           log(`❌ Job #${job.id} error: ${err.message}`);
           try { await api.reportResult(job.id, 'FAILED', err.message); } catch {}
           activeUploads.delete(channelId);
+
+          // Set cooldown for persistent errors (avoid retry floods)
+          const errLower = (err.message || '').toLowerCase();
+          if (
+            errLower.includes('oops') ||
+            errLower.includes('session expired') ||
+            errLower.includes('re-login') ||
+            errLower.includes('"data" argument')
+          ) {
+            const cooldownMin = 60;
+            channelCooldown.set(channelId, {
+              until: Date.now() + cooldownMin * 60 * 1000,
+              reason: err.message.substring(0, 80),
+            });
+            log(`🧊 Channel "${job.channel.name}" cooldown ${cooldownMin} phút: ${err.message.substring(0, 60)}`);
+          }
         });
 
         // ★ Stagger delay: wait 3 minutes between starting concurrent jobs
